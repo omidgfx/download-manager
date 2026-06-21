@@ -1,0 +1,61 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Download {
+  id             String    @id @default(cuid())
+  url            String
+  filename       String
+  directory      String // relative to DOWNLOAD_DIR
+  totalSize      BigInt? // bytes
+  downloadedSize BigInt    @default(0)
+  chunkCount     Int       @default(1)
+  status         Status    @default(PENDING)
+  scheduledAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  chunks Chunk[]
+
+  @@index([status])
+}
+
+model Chunk {
+  id              String      @id @default(cuid())
+  downloadId      String
+  index           Int // 0-based
+  startByte       BigInt
+  endByte         BigInt?
+  downloadedBytes BigInt      @default(0)
+  status          ChunkStatus @default(PENDING)
+
+  download Download @relation(fields: [downloadId], references: [id], onDelete: Cascade)
+
+  @@unique([downloadId, index])
+}
+
+model Setting {
+  key   String @id
+  value Json
+}
+
+enum Status {
+  PENDING
+  DOWNLOADING
+  PAUSED
+  COMPLETED
+  ERROR
+  SCHEDULED
+}
+
+enum ChunkStatus {
+  PENDING
+  ACTIVE
+  DONE
+  ERROR
+}

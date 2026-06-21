@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Download Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+<div id="app" class="container mx-auto p-4">
+    <h1 class="text-3xl font-bold mb-4">📥 Download Manager</h1>
+
+    <button class="btn btn-outline btn-sm mb-4" onclick="showSettingsModal()">⚙️ Settings</button>
+    <button class="btn btn-primary mb-4" onclick="showAddModal()">➕ Add Download</button>
+
+    <div id="downloadList" class="grid grid-cols-1 gap-4">
+        <!-- Cards will be rendered here -->
+    </div>
+</div>
+
+<!-- Add/Edit Modal -->
+<dialog id="addModal" class="modal">
+    <div class="modal-box">
+        <h3 class="font-bold text-lg" id="modalTitle">New Download</h3>
+        <form id="addForm">
+            <input type="hidden" id="editId" />
+            <div class="form-control">
+                <label class="label">URL</label>
+                <input type="url" id="urlInput" class="input input-bordered" required />
+            </div>
+            <div class="form-control">
+                <label class="label">Filename (optional)</label>
+                <input type="text" id="filenameInput" class="input input-bordered" />
+            </div>
+            <div class="form-control">
+                <label class="label">Directory (relative)</label>
+                <input type="text" id="dirInput" class="input input-bordered" placeholder="subfolder" />
+            </div>
+            <div class="form-control">
+                <label class="label">Connections (parts)</label>
+                <input type="number" id="chunkInput" class="input input-bordered" value="4" min="1" max="16" />
+            </div>
+            <div class="form-control">
+                <label class="label">Schedule (optional)</label>
+                <input type="datetime-local" id="scheduleInput" class="input input-bordered" />
+            </div>
+            <div class="modal-action">
+                <button type="submit" class="btn btn-primary">Save</button>
+                <button type="button" class="btn" onclick="document.getElementById('addModal').close()">Cancel</button>
+            </div>
+        </form>
+    </div>
+</dialog>
+
+<!-- Settings Modal -->
+<dialog id="settingsModal" class="modal">
+    <div class="modal-box">
+        <h3 class="font-bold text-lg">Settings</h3>
+        <form id="settingsForm">
+            <div class="form-control">
+                <label class="label">Download Directory</label>
+                <input type="text" id="downloadDirInput" class="input input-bordered" />
+            </div>
+            <div class="form-control">
+                <label class="label">Max Concurrent Tasks</label>
+                <input type="number" id="maxTasksInput" class="input input-bordered" min="1" max="10" />
+            </div>
+            <div class="modal-action">
+                <button type="submit" class="btn btn-primary">Save</button>
+                <button type="button" class="btn" onclick="document.getElementById('settingsModal').close()">Cancel</button>
+            </div>
+        </form>
+    </div>
+</dialog>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
