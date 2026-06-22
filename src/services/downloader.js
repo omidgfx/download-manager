@@ -23,11 +23,9 @@ class DownloadService {
 
         const totalSize = download.totalSize ? Number(download.totalSize) : null;
         let chunkCount = download.chunkCount;
-        if (!totalSize || totalSize === 0) {
-            chunkCount = 1;
-            await query('UPDATE downloads SET chunk_count = $1 WHERE id = $2', [chunkCount, downloadId]);
-            download = await queryOne('SELECT * FROM downloads WHERE id = $1', [downloadId]);
-        }
+
+        // If totalSize is still unknown, we cannot split – keep existing chunkCount (should be 1)
+        // No forced override here; chunkCount was set correctly at creation.
 
         const baseDir = path.resolve(config.downloadDir, download.directory);
         await fs.promises.mkdir(baseDir, { recursive: true });
@@ -148,7 +146,7 @@ class DownloadService {
             const id = generateId();
             await query(
                 `INSERT INTO chunks (id, download_id, index, start_byte, end_byte, downloaded_bytes, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
                 [id, ch.downloadId, ch.index, ch.startByte, ch.endByte, ch.downloadedBytes, ch.status]
             );
         }

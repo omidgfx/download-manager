@@ -48,9 +48,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ----- IMPORTANT: externalRoutes must be mounted BEFORE static files -----
-// It handles requests to '/' with a 'url' query parameter.
-// If no 'url' param, it calls next() and the static/catch-all handle the rest.
+// ----- External route at root (handles ?url=) -----
 app.use('/', externalRoutes);
 
 // Serve static files (UI)
@@ -59,7 +57,7 @@ app.use(express.static(path.join(__dirname, '../public')));
 // API routes (mounted under /api)
 app.use('/api', apiRoutes);
 
-// Catch-all: serve the index.html for any other GET requests (SPA)
+// Catch-all for SPA
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, '../public/index.html'));
 });

@@ -9,7 +9,6 @@ const { enqueueDownload } = require('../services/taskQueue');
 const axios = require('axios');
 const { query, generateId } = require('../db');
 
-// This route is mounted at '/'. It only processes requests that have a 'url' query parameter.
 router.get('/', async (req, res, next) => {
     const { url, dir, name } = req.query;
 
@@ -43,30 +42,33 @@ router.get('/', async (req, res, next) => {
     await fs.mkdir(basePath, { recursive: true });
     const { finalName: uniqueName } = await ensureUniqueFilename(basePath, finalName);
 
-    // Detect range support
+    // HEAD request: get total size and range support
+    let totalSize = null;
     let supportsRange = false;
     try {
         const headRes = await axios.head(decodedUrl, { timeout: 5000 });
+        totalSize = parseInt(headRes.headers['content-length'], 10) || null;
         supportsRange = headRes.headers['accept-ranges'] === 'bytes';
     } catch (err) {
         console.warn('HEAD request failed, assuming no range support', err.message);
     }
 
     const maxChunks = await getSetting('defaultChunkCount') || 4;
-    const effectiveChunkCount = supportsRange ? maxChunks : 1;
+    // Only use multipart if we know the total size AND the server supports ranges
+    const effectiveChunkCount = (supportsRange && totalSize) ? maxChunks : 1;
 
     const id = generateId();
     const result = await query(
         `INSERT INTO downloads (id, url, filename, directory, total_size, downloaded_size, chunk_count, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING *`,
-        [id, decodedUrl, uniqueName, relativeDir, null, 0, effectiveChunkCount, 'PENDING']
+        [id, decodedUrl, uniqueName, relativeDir, totalSize, 0, effectiveChunkCount, 'PENDING']
     );
     const download = result[0];
 
     enqueueDownload(download.id);
 
-    // Return a JSON response (or you could redirect to the UI)
+    // Return JSON response (or redirect to UI if desired)
     res.json({ success: true, taskId: download.id, filename: uniqueName });
 });
 
