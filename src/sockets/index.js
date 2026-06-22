@@ -1,7 +1,6 @@
 const { Server } = require('socket.io');
 const DownloadService = require('../services/downloader');
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const { queryOne } = require('../db');
 
 let io;
 
@@ -13,24 +12,17 @@ function initSocket(server) {
     });
 
     DownloadService.eventEmitter.on('progress', async (downloadId, progress) => {
-        // Fetch totalSize and this chunk's downloadedBytes
         const [download, chunk] = await Promise.all([
-            prisma.download.findUnique({
-                where: { id: downloadId },
-                select: { totalSize: true },
-            }),
-            prisma.chunk.findUnique({
-                where: { id: progress.chunkId },
-                select: { downloadedBytes: true },
-            })
+            queryOne('SELECT total_size FROM downloads WHERE id = $1', [downloadId]),
+            queryOne('SELECT downloaded_bytes FROM chunks WHERE id = $1', [progress.chunkId])
         ]);
         const totalSize = download?.totalSize ? Number(download.totalSize) : null;
         const chunkDownloadedBytes = chunk ? Number(chunk.downloadedBytes) : 0;
         io.emit('downloadProgress', {
             downloadId,
             chunkId: progress.chunkId,
-            chunkDownloadedBytes,        // per-chunk progress
-            downloadedBytes: progress.downloadedBytes, // total downloaded (all chunks)
+            chunkDownloadedBytes,
+            downloadedBytes: progress.downloadedBytes,
             total: progress.total,
             totalSize,
         });

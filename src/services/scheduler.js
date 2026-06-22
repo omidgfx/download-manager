@@ -1,57 +1,43 @@
 const schedule = require('node-schedule');
-const { PrismaClient } = require('@prisma/client');
+const { query, queryOne } = require('../db');
 const { enqueueDownload } = require('./taskQueue');
 
-const prisma = new PrismaClient();
 const scheduledJobs = new Map();
 
 async function initScheduler() {
-    const now = new Date();
-    // Process due tasks
-    const due = await prisma.download.findMany({
-        where: {
-            OR: [
-                { status: 'PENDING' },
-                { status: 'SCHEDULED' },
-            ],
-            scheduledAt: { lte: now },
-        },
-    });
+    const now = new Date().toISOString();
+
+    const due = await query(
+        `SELECT id, status, scheduled_at FROM downloads
+     WHERE status IN ('PENDING', 'SCHEDULED')
+       AND scheduled_at <= $1`,
+        [now]
+    );
     for (const d of due) {
         enqueueDownload(d.id);
         if (d.status === 'SCHEDULED') {
-            await prisma.download.update({
-                where: { id: d.id },
-                data: { status: 'PENDING' },
-            });
+            await query('UPDATE downloads SET status = $1 WHERE id = $2', ['PENDING', d.id]);
         }
     }
 
-    // Schedule future tasks
-    const future = await prisma.download.findMany({
-        where: {
-            status: 'SCHEDULED',
-            scheduledAt: { gt: now },
-        },
-    });
+    const future = await query(
+        `SELECT id, scheduled_at FROM downloads
+     WHERE status = 'SCHEDULED' AND scheduled_at > $1`,
+        [now]
+    );
     for (const d of future) {
-        scheduleDownload(d.id, d.scheduledAt);
+        scheduleDownload(d.id, new Date(d.scheduledAt));
     }
 }
 
 function scheduleDownload(downloadId, date) {
-    // Cancel any existing job for this download
     if (scheduledJobs.has(downloadId)) {
         scheduledJobs.get(downloadId).cancel();
         scheduledJobs.delete(downloadId);
     }
     const job = schedule.scheduleJob(date, async () => {
         try {
-            // When job fires, enqueue the download and update status to PENDING
-            await prisma.download.update({
-                where: { id: downloadId },
-                data: { status: 'PENDING', scheduledAt: null },
-            });
+            await query('UPDATE downloads SET status = $1, scheduled_at = NULL WHERE id = $2', ['PENDING', downloadId]);
             enqueueDownload(downloadId);
         } catch (err) {
             console.error(`Failed to start scheduled download ${downloadId}:`, err);

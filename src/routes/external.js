@@ -1,6 +1,5 @@
 const express = require('express');
 const router = express.Router();
-const { PrismaClient } = require('@prisma/client');
 const { sanitizeDirectory, ensureUniqueFilename } = require('../utils/pathSanitizer');
 const { getSetting } = require('../services/settings');
 const config = require('../config');
@@ -8,8 +7,7 @@ const path = require('path');
 const fs = require('fs').promises;
 const { enqueueDownload } = require('../services/taskQueue');
 const axios = require('axios');
-
-const prisma = new PrismaClient();
+const { query, generateId } = require('../db');
 
 router.get('/', async (req, res) => {
     const { url, dir, name } = req.query;
@@ -41,7 +39,6 @@ router.get('/', async (req, res) => {
     await fs.mkdir(basePath, { recursive: true });
     const { finalName: uniqueName } = await ensureUniqueFilename(basePath, finalName);
 
-    // Detect range support
     let supportsRange = false;
     try {
         const headRes = await axios.head(decodedUrl, { timeout: 5000 });
@@ -53,17 +50,14 @@ router.get('/', async (req, res) => {
     const maxChunks = await getSetting('defaultChunkCount') || 4;
     const effectiveChunkCount = supportsRange ? maxChunks : 1;
 
-    const download = await prisma.download.create({
-        data: {
-            url: decodedUrl,
-            filename: uniqueName,
-            directory: relativeDir,
-            totalSize: null,
-            downloadedSize: 0n,
-            chunkCount: effectiveChunkCount,
-            status: 'PENDING',
-        },
-    });
+    const id = generateId();
+    const result = await query(
+        `INSERT INTO downloads (id, url, filename, directory, total_size, downloaded_size, chunk_count, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING *`,
+        [id, decodedUrl, uniqueName, relativeDir, null, 0, effectiveChunkCount, 'PENDING']
+    );
+    const download = result[0];
 
     enqueueDownload(download.id);
     res.json({ success: true, taskId: download.id, filename: uniqueName });

@@ -1,17 +1,16 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const { query, queryOne } = require('../db');
 
 async function getSetting(key) {
-    const setting = await prisma.setting.findUnique({ where: { key } });
-    return setting ? setting.value : null;
+    const row = await queryOne('SELECT value FROM settings WHERE key = $1', [key]);
+    return row ? row.value : null;
 }
 
 async function setSetting(key, value) {
-    await prisma.setting.upsert({
-        where: { key },
-        update: { value },
-        create: { key, value },
-    });
+    await query(
+        `INSERT INTO settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [key, value]
+    );
 }
 
 async function initSettings() {

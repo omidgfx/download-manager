@@ -1,12 +1,10 @@
-const { PrismaClient } = require('@prisma/client');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
 const config = require('../config');
 const { ensureUniqueFilename } = require('../utils/pathSanitizer');
-
-const prisma = new PrismaClient();
+const { query, queryOne, generateId } = require('../db');
 
 class DownloadService {
     static activeDownloads = new Map();
@@ -18,10 +16,7 @@ class DownloadService {
     }
 
     static async startDownload(downloadId) {
-        let download = await prisma.download.findUnique({
-            where: { id: downloadId },
-            include: { chunks: true },
-        });
+        let download = await queryOne('SELECT * FROM downloads WHERE id = $1', [downloadId]);
         if (!download) throw new Error('Download not found');
         if (download.status === 'COMPLETED') return;
         if (download.status === 'PAUSED') return;
@@ -30,14 +25,8 @@ class DownloadService {
         let chunkCount = download.chunkCount;
         if (!totalSize || totalSize === 0) {
             chunkCount = 1;
-            await prisma.download.update({
-                where: { id: downloadId },
-                data: { chunkCount: 1 },
-            });
-            download = await prisma.download.findUnique({
-                where: { id: downloadId },
-                include: { chunks: true },
-            });
+            await query('UPDATE downloads SET chunk_count = $1 WHERE id = $2', [chunkCount, downloadId]);
+            download = await queryOne('SELECT * FROM downloads WHERE id = $1', [downloadId]);
         }
 
         const baseDir = path.resolve(config.downloadDir, download.directory);
@@ -45,27 +34,21 @@ class DownloadService {
         const finalPath = path.join(baseDir, download.filename);
         const tempPath = finalPath + '.part';
 
-        const isFresh = download.chunks.length === 0 && download.downloadedSize === 0n;
+        let chunks = await query('SELECT * FROM chunks WHERE download_id = $1 ORDER BY index ASC', [downloadId]);
+
+        const isFresh = chunks.length === 0 && download.downloadedSize === 0;
         if (download.status === 'PENDING' && isFresh) {
             const { finalName } = await ensureUniqueFilename(baseDir, download.filename);
             if (finalName !== download.filename) {
-                await prisma.download.update({
-                    where: { id: downloadId },
-                    data: { filename: finalName },
-                });
-                download = await prisma.download.findUnique({
-                    where: { id: downloadId },
-                    include: { chunks: true },
-                });
+                await query('UPDATE downloads SET filename = $1 WHERE id = $2', [finalName, downloadId]);
+                download = await queryOne('SELECT * FROM downloads WHERE id = $1', [downloadId]);
             }
         }
 
-        let chunks = download.chunks;
         if (chunks.length === 0) {
             chunks = await this.createChunks(downloadId, chunkCount, totalSize);
         }
 
-        // Pre-allocate temp file
         if (totalSize) {
             try {
                 const fd = fs.openSync(tempPath, 'w');
@@ -79,10 +62,7 @@ class DownloadService {
         }
 
         const abortController = new AbortController();
-        await prisma.download.update({
-            where: { id: downloadId },
-            data: { status: 'DOWNLOADING' },
-        });
+        await query('UPDATE downloads SET status = $1 WHERE id = $2', ['DOWNLOADING', downloadId]);
 
         DownloadService.eventEmitter.emit('downloadStarted', downloadId);
 
@@ -103,10 +83,7 @@ class DownloadService {
             })),
         });
 
-        const tasks = chunks.map((_, i) => () =>
-            this.downloadChunk(downloadId, i, abortController.signal)
-        );
-
+        const tasks = chunks.map((_, i) => () => this.downloadChunk(downloadId, i, abortController.signal));
         const concurrency = Math.min(chunkCount, 4);
         let error = null;
         try {
@@ -115,31 +92,23 @@ class DownloadService {
             error = err;
             if (this.isCancelError(err)) {
                 await this.flushProgress(downloadId);
-                await prisma.download.update({
-                    where: { id: downloadId },
-                    data: { status: 'PAUSED' },
-                });
+                await query('UPDATE downloads SET status = $1 WHERE id = $2', ['PAUSED', downloadId]);
                 DownloadService.activeDownloads.delete(downloadId);
                 DownloadService.progressCache.delete(downloadId);
                 return;
             }
         }
 
-        // Final flush – retry a few times if it fails
         try {
             await this.flushProgress(downloadId);
         } catch (flushErr) {
-            console.error(`Flush failed for ${downloadId}, but continuing:`, flushErr);
+            console.error(`Flush failed for ${downloadId}:`, flushErr);
         }
 
-        // Check if all chunks are DONE (with retries)
         let allDone = false;
         for (let attempt = 0; attempt < 3; attempt++) {
-            const updatedChunks = await prisma.chunk.findMany({
-                where: { downloadId },
-                select: { status: true },
-            });
-            allDone = updatedChunks.every(c => c.status === 'DONE');
+            const rows = await query('SELECT status FROM chunks WHERE download_id = $1', [downloadId]);
+            allDone = rows.every(r => r.status === 'DONE');
             if (allDone) break;
             if (attempt < 2) await new Promise(r => setTimeout(r, 500));
         }
@@ -148,12 +117,9 @@ class DownloadService {
             await this.markComplete(downloadId);
             DownloadService.eventEmitter.emit('downloadComplete', downloadId);
         } else {
-            // If allDone is false but the file is complete (maybe DB glitch), we can force complete
-            // by checking file size or existence.
             const stat = await fs.promises.stat(tempPath).catch(() => null);
             if (stat && totalSize && stat.size === totalSize) {
-                // File is complete, so force COMPLETED
-                console.log(`Download ${downloadId} file is complete but DB said not all done. Forcing COMPLETED.`);
+                console.log(`Download ${downloadId} file complete, forcing COMPLETED.`);
                 await this.markComplete(downloadId);
                 DownloadService.eventEmitter.emit('downloadComplete', downloadId);
             } else {
@@ -169,37 +135,28 @@ class DownloadService {
     static async createChunks(downloadId, chunkCount, totalSize) {
         const chunks = [];
         if (!totalSize) {
-            chunks.push({
-                downloadId,
-                index: 0,
-                startByte: 0n,
-                endByte: null,
-                downloadedBytes: 0n,
-                status: 'PENDING',
-            });
+            chunks.push({ downloadId, index: 0, startByte: 0, endByte: null, downloadedBytes: 0, status: 'PENDING' });
         } else {
             const chunkSize = Math.ceil(totalSize / chunkCount);
             for (let i = 0; i < chunkCount; i++) {
                 const start = i * chunkSize;
                 const end = (i === chunkCount - 1) ? totalSize - 1 : (start + chunkSize - 1);
-                chunks.push({
-                    downloadId,
-                    index: i,
-                    startByte: BigInt(start),
-                    endByte: BigInt(end),
-                    downloadedBytes: 0n,
-                    status: 'PENDING',
-                });
+                chunks.push({ downloadId, index: i, startByte: start, endByte: end, downloadedBytes: 0, status: 'PENDING' });
             }
         }
-        await prisma.chunk.createMany({ data: chunks });
-        return prisma.chunk.findMany({ where: { downloadId } });
+        for (const ch of chunks) {
+            const id = generateId();
+            await query(
+                `INSERT INTO chunks (id, download_id, index, start_byte, end_byte, downloaded_bytes, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [id, ch.downloadId, ch.index, ch.startByte, ch.endByte, ch.downloadedBytes, ch.status]
+            );
+        }
+        return query('SELECT * FROM chunks WHERE download_id = $1 ORDER BY index ASC', [downloadId]);
     }
 
     static async downloadChunk(downloadId, chunkIndex, signal) {
-        const chunk = await prisma.chunk.findFirst({
-            where: { downloadId, index: chunkIndex },
-        });
+        const chunk = await queryOne('SELECT * FROM chunks WHERE download_id = $1 AND index = $2', [downloadId, chunkIndex]);
         if (!chunk) throw new Error(`Chunk ${chunkIndex} not found`);
         if (chunk.status === 'DONE') return;
 
@@ -209,12 +166,20 @@ class DownloadService {
         const startFrom = startByte + alreadyDownloaded;
 
         if (endByte !== undefined && alreadyDownloaded >= (endByte - startByte + 1)) {
-            // Already done, mark DONE
             await this.markChunkDone(chunk.id, alreadyDownloaded);
+            const cache = DownloadService.progressCache.get(downloadId);
+            if (cache) {
+                const total = cache.chunks.reduce((sum, c) => sum + c.downloaded, 0);
+                DownloadService.eventEmitter.emit('progress', downloadId, {
+                    chunkId: chunk.id,
+                    downloadedBytes: total,
+                    total: total,
+                });
+            }
             return;
         }
 
-        const download = await prisma.download.findUnique({ where: { id: downloadId } });
+        const download = await queryOne('SELECT * FROM downloads WHERE id = $1', [downloadId]);
         const url = download.url;
         const headers = {};
         if (endByte !== undefined) {
@@ -232,7 +197,7 @@ class DownloadService {
 
         let downloadedBytes = alreadyDownloaded;
         let lastDbUpdate = alreadyDownloaded;
-        const dbUpdateThreshold = 512 * 1024; // 512 KB
+        const dbUpdateThreshold = 512 * 1024;
 
         const response = await axios({
             method: 'GET',
@@ -260,18 +225,12 @@ class DownloadService {
 
                 if (current - lastDbUpdate >= dbUpdateThreshold) {
                     lastDbUpdate = current;
-                    // Fire-and-forget with retry
-                    this.updateProgress(downloadId, chunk.id, current)
-                        .catch(err => console.error('Progress update error:', err));
+                    this.updateProgress(downloadId, chunk.id, current).catch(() => {});
                 }
             }
         });
 
-        const writeStream = fs.createWriteStream(filePath, {
-            flags: 'r+',
-            start: startFrom,
-        });
-
+        const writeStream = fs.createWriteStream(filePath, { flags: 'r+', start: startFrom });
         await new Promise((resolve, reject) => {
             response.data.pipe(writeStream);
             writeStream.on('finish', resolve);
@@ -279,14 +238,9 @@ class DownloadService {
             response.data.on('error', reject);
         });
 
-        // Update progress one last time (with retries)
-        await this.updateProgress(downloadId, chunk.id, downloadedBytes)
-            .catch(err => console.error('Final progress update error:', err));
-
-        // Mark chunk as DONE (with retries)
+        await this.updateProgress(downloadId, chunk.id, downloadedBytes).catch(() => {});
         await this.markChunkDone(chunk.id, downloadedBytes);
 
-        // Emit final progress
         const cache = DownloadService.progressCache.get(downloadId);
         if (cache) {
             const chunkCache = cache.chunks.find(c => c.id === chunk.id);
@@ -301,17 +255,10 @@ class DownloadService {
     }
 
     static async markChunkDone(chunkId, downloadedBytes) {
-        // Retry up to 3 times
         let lastErr;
         for (let attempt = 0; attempt < 3; attempt++) {
             try {
-                await prisma.chunk.update({
-                    where: { id: chunkId },
-                    data: {
-                        status: 'DONE',
-                        downloadedBytes: BigInt(downloadedBytes),
-                    },
-                });
+                await query('UPDATE chunks SET status = $1, downloaded_bytes = $2 WHERE id = $3', ['DONE', downloadedBytes, chunkId]);
                 return;
             } catch (err) {
                 lastErr = err;
@@ -322,23 +269,13 @@ class DownloadService {
     }
 
     static async updateProgress(downloadId, chunkId, downloadedBytes) {
-        // Retry up to 3 times
         let lastErr;
         for (let attempt = 0; attempt < 3; attempt++) {
             try {
-                await prisma.chunk.update({
-                    where: { id: chunkId },
-                    data: { downloadedBytes: BigInt(downloadedBytes), status: 'ACTIVE' },
-                });
-                const chunks = await prisma.chunk.findMany({
-                    where: { downloadId },
-                    select: { downloadedBytes: true },
-                });
-                const total = chunks.reduce((acc, c) => acc + c.downloadedBytes, 0n);
-                await prisma.download.update({
-                    where: { id: downloadId },
-                    data: { downloadedSize: total },
-                });
+                await query('UPDATE chunks SET downloaded_bytes = $1, status = $2 WHERE id = $3', [downloadedBytes, 'ACTIVE', chunkId]);
+                const rows = await query('SELECT downloaded_bytes FROM chunks WHERE download_id = $1', [downloadId]);
+                const total = rows.reduce((acc, r) => acc + Number(r.downloadedBytes), 0);
+                await query('UPDATE downloads SET downloaded_size = $1 WHERE id = $2', [total, downloadId]);
                 return;
             } catch (err) {
                 lastErr = err;
@@ -352,20 +289,11 @@ class DownloadService {
         const active = DownloadService.activeDownloads.get(downloadId);
         if (!active) return;
         for (const chunkMem of active.chunks) {
-            await prisma.chunk.update({
-                where: { id: chunkMem.id },
-                data: { downloadedBytes: BigInt(chunkMem.downloaded), status: 'ACTIVE' },
-            });
+            await query('UPDATE chunks SET downloaded_bytes = $1, status = $2 WHERE id = $3', [chunkMem.downloaded, 'ACTIVE', chunkMem.id]);
         }
-        const chunks = await prisma.chunk.findMany({
-            where: { downloadId },
-            select: { downloadedBytes: true },
-        });
-        const total = chunks.reduce((acc, c) => acc + c.downloadedBytes, 0n);
-        await prisma.download.update({
-            where: { id: downloadId },
-            data: { downloadedSize: total },
-        });
+        const rows = await query('SELECT downloaded_bytes FROM chunks WHERE download_id = $1', [downloadId]);
+        const total = rows.reduce((acc, r) => acc + Number(r.downloadedBytes), 0);
+        await query('UPDATE downloads SET downloaded_size = $1 WHERE id = $2', [total, downloadId]);
     }
 
     static async runWithConcurrency(tasks, concurrency) {
@@ -393,7 +321,7 @@ class DownloadService {
     }
 
     static async markComplete(downloadId) {
-        const download = await prisma.download.findUnique({ where: { id: downloadId } });
+        const download = await queryOne('SELECT * FROM downloads WHERE id = $1', [downloadId]);
         if (!download) return;
 
         const baseDir = path.resolve(config.downloadDir, download.directory);
@@ -401,24 +329,19 @@ class DownloadService {
         const tempPath = finalPath + '.part';
 
         try {
+            await fs.promises.access(tempPath);
             await fs.promises.rename(tempPath, finalPath);
         } catch (err) {
-            console.error(`Rename failed for ${downloadId}:`, err);
+            if (err.code !== 'ENOENT') console.error(`Rename failed: ${err.message}`);
         }
 
-        await prisma.download.update({
-            where: { id: downloadId },
-            data: { status: 'COMPLETED' },
-        });
+        await query('UPDATE downloads SET status = $1 WHERE id = $2', ['COMPLETED', downloadId]);
         DownloadService.activeDownloads.delete(downloadId);
         DownloadService.progressCache.delete(downloadId);
     }
 
     static async markError(downloadId) {
-        await prisma.download.update({
-            where: { id: downloadId },
-            data: { status: 'ERROR' },
-        });
+        await query('UPDATE downloads SET status = $1 WHERE id = $2', ['ERROR', downloadId]);
         DownloadService.activeDownloads.delete(downloadId);
         DownloadService.progressCache.delete(downloadId);
     }
@@ -428,24 +351,15 @@ class DownloadService {
         if (active) {
             active.abortController.abort();
         }
-        await prisma.download.update({
-            where: { id: downloadId },
-            data: { status: 'PAUSED' },
-        });
+        await query('UPDATE downloads SET status = $1 WHERE id = $2', ['PAUSED', downloadId]);
         DownloadService.progressCache.delete(downloadId);
     }
 
     static async resumeDownload(downloadId) {
-        const download = await prisma.download.findUnique({
-            where: { id: downloadId },
-            include: { chunks: true },
-        });
+        const download = await queryOne('SELECT * FROM downloads WHERE id = $1', [downloadId]);
         if (!download) throw new Error('Download not found');
         if (download.status !== 'PAUSED') throw new Error('Can only resume paused');
-        await prisma.download.update({
-            where: { id: downloadId },
-            data: { status: 'PENDING' },
-        });
+        await query('UPDATE downloads SET status = $1 WHERE id = $2', ['PENDING', downloadId]);
         DownloadService.eventEmitter.emit('downloadResumed', downloadId);
         return this.startDownload(downloadId);
     }
@@ -457,10 +371,7 @@ class DownloadService {
             DownloadService.activeDownloads.delete(downloadId);
             DownloadService.progressCache.delete(downloadId);
         }
-        await prisma.download.update({
-            where: { id: downloadId },
-            data: { status: 'ERROR' },
-        });
+        await query('UPDATE downloads SET status = $1 WHERE id = $2', ['ERROR', downloadId]);
     }
 }
 
