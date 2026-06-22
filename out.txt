@@ -1,0 +1,2905 @@
+
+.env.example:
+```
+# APP_URL: The URL where this applet is hosted.
+# AI Studio automatically injects this at runtime with the Cloud Run service URL.
+# Used for self-referential links, OAuth callbacks, and API endpoints.
+APP_URL="MY_APP_URL"
+
+# PORT: The port the app runs on (must be 3000 in AI Studio)
+PORT=3000
+
+# DATABASE_URL: Local PostgreSQL or Termux PostgreSQL database url
+DATABASE_URL="postgresql://postgres:2@localhost:5432/download_manager"
+
+# DOWNLOAD_DIR: Directory where downloaded parts and finished files are saved
+DOWNLOAD_DIR="./downloads"
+
+# MAX_CONCURRENT_TASKS: Limits number of downloads running simultaneously
+MAX_CONCURRENT_TASKS=3
+```
+
+.gitignore:
+```
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+```
+
+index.html:
+```
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Fletch Downloader</title>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/main.tsx"></script>
+</body>
+</html>
+```
+
+metadata.json:
+```
+{
+  "name": "Fletch Downloader",
+  "description": "A smart multipart download manager with scheduling and real-time visualizer.",
+  "requestFramePermissions": []
+}
+```
+
+package.json:
+```
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "start": "node dist/server.cjs",
+    "clean": "rm -rf dist",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "axios": "^1.18.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "node-schedule": "^2.1.1",
+    "pg": "^8.22.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "uuid": "^14.0.1",
+    "vite": "^6.2.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "@types/node-schedule": "^2.1.8",
+    "@types/pg": "^8.20.0",
+    "@types/uuid": "^10.0.0",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.3"
+  }
+}
+```
+
+README.md:
+```
+# Fletch Downloader
+
+A smart multipart download manager with scheduling, real-time progress, and a clean UI.
+
+## Run Locally
+
+**Prerequisites:** Node.js
+
+1. Install dependencies:
+   `npm install`
+2. Configure the `.env` file with your settings (see `.env.example`).
+3. Run the app:
+   `npm run dev`
+```
+
+schema.sql:
+```
+-- ============================================================================
+-- SMART MULTIPART DOWNLOAD MANAGER SCHEMA
+-- For PostgreSQL (Works on standard setups & Termux / Android environment)
+-- ============================================================================
+
+-- Drop tables if they already exist to restart cleanly (be careful on production systems)
+DROP TABLE IF EXISTS chunks CASCADE;
+DROP TABLE IF EXISTS downloads CASCADE;
+DROP TABLE IF EXISTS settings CASCADE;
+
+-- ----------------------------------------------------------------------------
+-- Table 1: downloads
+-- Holds metadata, overall download status, and scheduling timestamps.
+-- ----------------------------------------------------------------------------
+CREATE TABLE downloads (
+                           id TEXT PRIMARY KEY,
+                           url TEXT NOT NULL,
+                           filename TEXT NOT NULL,
+                           directory TEXT NOT NULL,
+                           total_size BIGINT,
+                           downloaded_size BIGINT DEFAULT 0,
+                           chunk_count INTEGER DEFAULT 1,
+                           status TEXT DEFAULT 'PENDING', -- 'PENDING', 'DOWNLOADING', 'PAUSED', 'COMPLETED', 'ERROR', 'SCHEDULED'
+                           scheduled_at TIMESTAMP,
+                           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Index for status to speed up state filters and queue retrieval
+CREATE INDEX idx_downloads_status ON downloads(status);
+
+-- ----------------------------------------------------------------------------
+-- Table 2: chunks
+-- Tracks byte ranges and individual stream/slice progress for multipart downloading.
+-- ----------------------------------------------------------------------------
+CREATE TABLE chunks (
+                        id TEXT PRIMARY KEY,
+                        download_id TEXT REFERENCES downloads(id) ON DELETE CASCADE,
+                        index INTEGER NOT NULL,
+                        start_byte BIGINT NOT NULL,
+                        end_byte BIGINT,
+                        downloaded_bytes BIGINT DEFAULT 0,
+                        status TEXT DEFAULT 'PENDING', -- 'PENDING', 'ACTIVE', 'DONE', 'ERROR'
+                        UNIQUE(download_id, index)
+);
+
+-- Index to optimize chunk range lookup speed
+CREATE INDEX idx_chunks_download_id ON chunks(download_id);
+
+-- ----------------------------------------------------------------------------
+-- Table 3: settings
+-- Persistent configuration keys and JSON payloads.
+-- ----------------------------------------------------------------------------
+CREATE TABLE settings (
+                          key TEXT PRIMARY KEY,
+                          value JSONB NOT NULL
+);
+
+-- Inject defaults into settings
+INSERT INTO settings (key, value) VALUES
+                                      ('downloadDirectory', '"./downloads"'),
+                                      ('maxConcurrentTasks', '3'),
+                                      ('defaultChunkCount', '4')
+    ON CONFLICT (key) DO NOTHING;
+
+-- ----------------------------------------------------------------------------
+-- Trigger Function: Automatic UpdatedAt Synchronization
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_downloads_updated_at
+    BEFORE UPDATE ON downloads
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+```
+
+server.ts:
+```
+import express from "express";
+import http from "http";
+import path from "path";
+import fs from "fs";
+import cors from "cors";
+import axios from "axios";
+import { Server } from "socket.io";
+import { createServer as createViteServer } from "vite";
+
+import { initializeDatabase, query, queryOne, generateId } from "./src/server/db";
+import { initSettings, getSetting, setSetting } from "./src/server/settings";
+import { initScheduler, scheduleDownload, cancelScheduledJob } from "./src/server/scheduler";
+import { DownloadService } from "./src/server/downloader";
+import { enqueueDownload, taskQueue } from "./src/server/taskQueue";
+import { sanitizeDirectory, ensureUniqueFilename, configureDownloadDirectory } from "./src/server/pathSanitizer";
+
+// Helper to get filename from URL
+function getFilenameFromUrl(url: string): string {
+    try {
+        const parsed = new URL(url);
+        const base = path.basename(parsed.pathname);
+        return base || "download.bin";
+    } catch {
+        return "download.bin";
+    }
+}
+
+const PORT = 3000;
+
+async function start() {
+    const app = express();
+    const server = http.createServer(app);
+
+    // Initialize Socket.io server
+    const io = new Server(server, {
+        cors: {
+            origin: "*",
+        },
+    });
+
+    app.use(cors());
+    app.use(express.json());
+    app.use(express.urlencoded({ extended: true }));
+
+    // Initialize Database, Settings and Scheduler
+    await initializeDatabase();
+    await initSettings();
+
+    const savedDownloadDir = (await getSetting<string>("downloadDirectory")) || "./downloads";
+    configureDownloadDirectory(savedDownloadDir);
+
+    await initScheduler();
+
+    // Socket event forwarding from download activities
+    DownloadService.eventEmitter.on("progress", (downloadId, data) => {
+        io.emit("downloadProgress", {
+            downloadId,
+            chunkId: data.chunkId,
+            chunkDownloadedBytes: data.chunkDownloadedBytes,
+            downloadedBytes: data.downloadedBytes,
+            total: data.total,
+        });
+    });
+
+    DownloadService.eventEmitter.on("downloadStarted", (downloadId) => {
+        io.emit("downloadStarted", downloadId);
+    });
+
+    DownloadService.eventEmitter.on("downloadPaused", (downloadId) => {
+        io.emit("downloadPaused", downloadId);
+    });
+
+    DownloadService.eventEmitter.on("downloadComplete", (downloadId) => {
+        io.emit("downloadComplete", downloadId);
+    });
+
+    DownloadService.eventEmitter.on("downloadError", (downloadId) => {
+        io.emit("downloadError", downloadId);
+    });
+
+    DownloadService.eventEmitter.on("downloadResumed", (downloadId) => {
+        io.emit("downloadResumed", downloadId);
+    });
+
+    io.on("connection", (socket) => {
+        console.log(`Socket client connected: ${socket.id}`);
+        socket.emit("connected", { status: "Ready" });
+
+        socket.on("disconnect", () => {
+            console.log(`Socket client disconnected: ${socket.id}`);
+        });
+    });
+
+    // --- 1. SILENT URL PARSER / INTERCEPTOR ROUTE ---
+    app.get("/", async (req, res, next) => {
+        const urlParam = req.query.url;
+        if (!urlParam) {
+            return next(); // Fall through to Vite/SPA handler
+        }
+
+        try {
+            const targetUrl = decodeURIComponent(urlParam as string).trim();
+            new URL(targetUrl); // Try to validate URI
+
+            const nameParam = req.query.name as string | undefined;
+            const indexParam = req.query.dir as string | undefined;
+
+            // Simple filename from URL or provided name
+            let filename = nameParam || getFilenameFromUrl(targetUrl);
+            const targetDir = indexParam ? sanitizeDirectory(indexParam) : sanitizeDirectory("");
+            const resolvedDir = targetDir ? path.relative(savedDownloadDir, path.resolve(savedDownloadDir, targetDir)) : "";
+
+            const activeBaseDir = path.resolve(savedDownloadDir, resolvedDir);
+            await fs.promises.mkdir(activeBaseDir, { recursive: true });
+
+            const { finalName } = await ensureUniqueFilename(activeBaseDir, filename);
+
+            // C. Content discovery HEAD request check
+            let totalSize: number | null = null;
+            let supportsRange = false;
+            try {
+                const headRes = await axios.head(targetUrl, { timeout: 3000 });
+                const contentLength = headRes.headers["content-length"];
+                totalSize = contentLength ? parseInt(String(contentLength), 10) : null;
+                supportsRange = String(headRes.headers["accept-ranges"] || "") === "bytes";
+            } catch {
+                // Safe standard fallback
+            }
+
+            const optimalChunkCount = supportsRange && totalSize ? 4 : 1;
+            const id = generateId();
+
+            await query(
+                `INSERT INTO downloads (id, url, filename, directory, total_size, downloaded_size, chunk_count, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     RETURNING *`,
+                [id, targetUrl, finalName, resolvedDir, totalSize, 0, optimalChunkCount, "PENDING"]
+            );
+
+            enqueueDownload(id);
+
+            // Respond directly for Extension compatibility
+            res.json({
+                success: true,
+                taskId: id,
+                filename: finalName,
+                directory: resolvedDir || "downloads",
+                message: "Silent download initialized and added to queue.",
+            });
+        } catch (err: any) {
+            console.error("Silent direct downloader error:", err.message);
+            res.status(400).json({
+                success: false,
+                error: "Failed to initialize silent download",
+                message: err.message,
+            });
+        }
+    });
+
+    // --- 2. API ENDPOINTS ---
+
+    // Get all downloads with chunks
+    app.get("/api/downloads", async (req, res) => {
+        try {
+            const records = await query(`
+                SELECT d.*, json_agg(c.*) as chunks
+                FROM downloads d
+                         LEFT JOIN chunks c ON d.id = c.download_id
+                GROUP BY d.id
+                ORDER BY d.created_at DESC
+            `);
+
+            // Clean up empty chunk aggregates from postgres or mock returns
+            const cleaned = records.map((r) => {
+                if (r.chunks && r.chunks[0] === null) {
+                    r.chunks = [];
+                }
+                return r;
+            });
+
+            res.json(cleaned);
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // Get active system stats
+    app.get("/api/downloads/stats", async (req, res) => {
+        try {
+            const list = await query("SELECT status, total_size, downloaded_size FROM downloads");
+            const activeCount = DownloadService.activeDownloads.size;
+            const totalSize = list.reduce((acc, d) => acc + (Number(d.totalSize) || 0), 0);
+            const totalDownloaded = list.reduce((acc, d) => acc + (Number(d.downloadedSize) || 0), 0);
+            res.json({
+                activeThreads: activeCount,
+                totalDownloads: list.length,
+                completedCount: list.filter((l) => l.status === "COMPLETED").length,
+                totalSize,
+                totalDownloaded,
+            });
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // Add a new download task
+    app.post("/api/downloads", async (req, res) => {
+        const { url, filename, directory, chunkCount, scheduledAt } = req.body;
+        if (!url) return res.status(400).json({ error: "Destination URL is required" });
+
+        try {
+            const finalUrl = url.trim();
+
+            // Simple filename fallback
+            let finalFilename = filename || getFilenameFromUrl(finalUrl);
+
+            let scheduleDate: Date | null = null;
+            if (scheduledAt) {
+                scheduleDate = new Date(scheduledAt);
+                if (isNaN(scheduleDate.getTime())) {
+                    return res.status(400).json({ error: "Provided execution date is invalid" });
+                }
+            }
+
+            const resolvedDir = directory
+                ? path.relative(savedDownloadDir, sanitizeDirectory(directory))
+                : "";
+
+            const activeBaseDir = path.resolve(savedDownloadDir, resolvedDir);
+            await fs.promises.mkdir(activeBaseDir, { recursive: true });
+
+            const { finalName } = await ensureUniqueFilename(activeBaseDir, finalFilename);
+
+            // Perform range investigation
+            let totalSize: number | null = null;
+            let supportsRange = false;
+            try {
+                const headRes = await axios.head(finalUrl, { timeout: 3000 });
+                const contentLength = headRes.headers["content-length"];
+                totalSize = contentLength ? parseInt(String(contentLength), 10) : null;
+                supportsRange = String(headRes.headers["accept-ranges"] || "") === "bytes";
+            } catch (err) {
+                // Fall back gracefully
+            }
+
+            let partitions = parseInt(chunkCount, 10) || 4;
+            partitions = Math.max(1, Math.min(16, partitions));
+            if (!supportsRange || !totalSize) {
+                partitions = 1;
+            }
+
+            const id = generateId();
+            const statusValue = scheduleDate ? "SCHEDULED" : "PENDING";
+
+            const records = await query(
+                `INSERT INTO downloads (id, url, filename, directory, total_size, downloaded_size, chunk_count, status, scheduled_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     RETURNING *`,
+                [id, finalUrl, finalName, resolvedDir, totalSize, 0, partitions, statusValue, scheduleDate]
+            );
+
+            const download = records[0];
+
+            if (scheduleDate) {
+                scheduleDownload(download.id, scheduleDate);
+            } else {
+                enqueueDownload(download.id);
+            }
+
+            res.status(201).json(download);
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // Pause an active download
+    app.post("/api/downloads/:id/pause", async (req, res) => {
+        const { id } = req.params;
+        try {
+            await DownloadService.pauseDownload(id);
+            res.json({ success: true, message: "Task active download paused" });
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // Resume a paused download
+    app.post("/api/downloads/:id/resume", async (req, res) => {
+        const { id } = req.params;
+        try {
+            await DownloadService.resumeDownload(id, savedDownloadDir);
+            res.json({ success: true, message: "Task download resume requested" });
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // Retry an errored download
+    app.post("/api/downloads/:id/retry", async (req, res) => {
+        const { id } = req.params;
+        try {
+            const download = await queryOne("SELECT * FROM downloads WHERE id = $1", [id]);
+            if (!download) return res.status(404).json({ error: "Task not found." });
+
+            await query("UPDATE chunks SET downloaded_bytes = 0, status = 'PENDING' WHERE download_id = $1", [id]);
+            await query("UPDATE downloads SET downloaded_size = 0, status = 'PENDING' WHERE id = $1", [id]);
+
+            enqueueDownload(id);
+            res.json({ success: true, message: "Task enqueued for re-evaluation" });
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // Update scheduling or general properties
+    app.put("/api/downloads/:id", async (req, res) => {
+        const { id } = req.params;
+        const { filename, chunkCount, scheduledAt } = req.body;
+
+        try {
+            const download = await queryOne("SELECT * FROM downloads WHERE id = $1", [id]);
+            if (!download) return res.status(404).json({ error: "Task not found" });
+
+            if (download.status === "DOWNLOADING") {
+                return res.status(400).json({ error: "Properties cannot be modified while downloading. Pause first." });
+            }
+
+            if (filename) {
+                const destDir = path.resolve(savedDownloadDir, download.directory);
+                const { finalName } = await ensureUniqueFilename(destDir, filename);
+                await query("UPDATE downloads SET filename = $1 WHERE id = $2", [finalName, id]);
+            }
+
+            if (chunkCount) {
+                const existingChunks = await query("SELECT * FROM chunks WHERE download_id = $1", [id]);
+                if (existingChunks.length > 0 && download.chunkCount !== chunkCount) {
+                    return res.status(400).json({ error: "Cannot modify partitions for started tasks. Delete and restart instead." });
+                }
+                await query("UPDATE downloads SET chunk_count = $1 WHERE id = $2", [Math.max(1, Math.min(16, chunkCount)), id]);
+            }
+
+            if (scheduledAt !== undefined) {
+                if (!scheduledAt) {
+                    cancelScheduledJob(id);
+                    await query("UPDATE downloads SET scheduled_at = NULL, status = 'PENDING' WHERE id = $1", [id]);
+                } else {
+                    const date = new Date(scheduledAt);
+                    if (isNaN(date.getTime())) {
+                        return res.status(400).json({ error: "Provided schedule date parsing failed." });
+                    }
+                    await query("UPDATE downloads SET scheduled_at = $1, status = 'SCHEDULED' WHERE id = $2", [date.toISOString(), id]);
+                    scheduleDownload(id, date);
+                }
+            }
+
+            const updated = await queryOne("SELECT * FROM downloads WHERE id = $1", [id]);
+            res.json(updated);
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // Delete a download and clean its parts
+    app.delete("/api/downloads/:id", async (req, res) => {
+        const { id } = req.params;
+        try {
+            const download = await queryOne("SELECT * FROM downloads WHERE id = $1", [id]);
+            if (!download) return res.status(404).json({ error: "Task not found" });
+
+            await DownloadService.stopDownload(id);
+            cancelScheduledJob(id);
+
+            const resolvedFolder = path.resolve(savedDownloadDir, download.directory);
+            const finishedPath = path.join(resolvedFolder, download.filename);
+            const partPath = finishedPath + ".part";
+
+            // File cleanup
+            await fs.promises.unlink(finishedPath).catch(() => {});
+            await fs.promises.unlink(partPath).catch(() => {});
+
+            await query("DELETE FROM downloads WHERE id = $1", [id]);
+            res.status(200).json({ success: true, message: "Download record removed and partition files wiped clean" });
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // Fetch all server system settings
+    app.get("/api/settings", async (req, res) => {
+        try {
+            const downloadDirectory = (await getSetting<string>("downloadDirectory")) || "./downloads";
+            const maxConcurrentTasks = (await getSetting<number>("maxConcurrentTasks")) || 3;
+            const defaultChunkCount = (await getSetting<number>("defaultChunkCount")) || 4;
+            res.json({ downloadDirectory, maxConcurrentTasks, defaultChunkCount });
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // Modify server system settings
+    app.put("/api/settings", async (req, res) => {
+        const { downloadDirectory, maxConcurrentTasks, defaultChunkCount } = req.body;
+        try {
+            if (downloadDirectory) {
+                const fullPath = path.resolve(downloadDirectory);
+                await setSetting("downloadDirectory", fullPath);
+                configureDownloadDirectory(fullPath);
+            }
+            if (maxConcurrentTasks !== undefined) {
+                const num = parseInt(maxConcurrentTasks, 10);
+                if (num > 0) {
+                    await setSetting("maxConcurrentTasks", num);
+                    taskQueue.setConcurrency(num);
+                }
+            }
+            if (defaultChunkCount !== undefined) {
+                const count = parseInt(defaultChunkCount, 10);
+                if (count > 0 && count <= 16) {
+                    await setSetting("defaultChunkCount", count);
+                }
+            }
+            res.json({ success: true, message: "Settings configuration successfully adjusted." });
+        } catch (err: any) {
+            res.status(500).json({ error: err.message });
+        }
+    });
+
+    // --- 3. FRONTEND SERVING (VITE MODE vs STATIC MODE) ---
+    if (process.env.NODE_ENV !== "production") {
+        const vite = await createViteServer({
+            server: { middlewareMode: true },
+            appType: "spa",
+        });
+        app.use(vite.middlewares);
+    } else {
+        // Production compiled asset directory
+        const distPath = path.join(process.cwd(), "dist");
+        app.use(express.static(distPath));
+        app.get("*", (req, res) => {
+            res.sendFile(path.join(distPath, "index.html"));
+        });
+    }
+
+    server.listen(PORT, "0.0.0.0", () => {
+        console.log(`Fletch Downloader fully operating on Server Port ${PORT}`);
+    });
+}
+
+start().catch((err) => {
+    console.error("FATAL SYSTEM STOP: Downloader engine crashed during boot execution:", err);
+    process.exit(1);
+});
+```
+
+src/App.tsx:
+```
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { io, Socket } from "socket.io-client";
+import {
+    AlertTriangle,
+    CheckCircle,
+    ChevronDown,
+    ChevronUp,
+    Clock,
+    Cpu,
+    Download,
+    ExternalLink,
+    Folder,
+    HelpCircle,
+    Link,
+    Pause,
+    Play,
+    Plus,
+    RotateCcw,
+    Search,
+    Settings,
+    Trash2
+} from "lucide-react";
+import { AnimatePresence, motion } from "motion/react";
+
+// Frontend interfaces mirroring database records
+interface Chunk {
+    id: string;
+    downloadId: string;
+    index: number;
+    startByte: number;
+    endByte: number | null;
+    downloadedBytes: number;
+    status: "PENDING" | "ACTIVE" | "DONE" | "ERROR";
+}
+
+interface DownloadItem {
+    id: string;
+    url: string;
+    filename: string;
+    directory: string;
+    totalSize: number | null;
+    downloadedSize: number;
+    chunkCount: number;
+    status: "PENDING" | "DOWNLOADING" | "PAUSED" | "COMPLETED" | "ERROR" | "SCHEDULED";
+    scheduledAt: string | null;
+    createdAt: string;
+    updatedAt: string;
+    chunks: Chunk[];
+}
+
+interface SystemStats {
+    activeThreads: number;
+    totalDownloads: number;
+    completedCount: number;
+    totalSize: number;
+    totalDownloaded: number;
+}
+
+interface UserSettings {
+    downloadDirectory: string;
+    maxConcurrentTasks: number;
+    defaultChunkCount: number;
+}
+
+export function App() {
+    // State variables
+    const [downloads, setDownloads] = useState<DownloadItem[]>([]);
+    const [stats, setStats] = useState<SystemStats>({
+        activeThreads: 0,
+        totalDownloads: 0,
+        completedCount: 0,
+        totalSize: 0,
+        totalDownloaded: 0,
+    });
+    const [settings, setSettings] = useState<UserSettings>({
+        downloadDirectory: "./downloads",
+        maxConcurrentTasks: 3,
+        defaultChunkCount: 4,
+    });
+
+    const [searchQuery, setSearchQuery] = useState("");
+    const [activeTab, setActiveTab] = useState<"all" | "downloading" | "completed" | "scheduled" | "error">("all");
+    const [expandedId, setExpandedId] = useState<string | null>(null);
+
+    // Modals state
+    const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+    const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+    const [isGuideOpen, setIsGuideOpen] = useState(false);
+
+    // Form input states
+    const [inputUrl, setInputUrl] = useState("");
+    const [inputFilename, setInputFilename] = useState("");
+    const [inputDirectory, setInputDirectory] = useState("");
+    const [inputChunkCount, setInputChunkCount] = useState(4);
+    const [inputScheduledAt, setInputScheduledAt] = useState("");
+
+    // Speed measurement ref
+    const lastProgressRef = useRef<Record<string, { bytes: number; time: number; speed: number }>>({});
+    const socketRef = useRef<Socket | null>(null);
+    const [wsConnected, setWsConnected] = useState(false);
+
+    // Fetch initial data
+    useEffect(() => {
+        fetchDownloads();
+        fetchStats();
+        fetchSettings();
+
+        // Setup Socket Connection
+        const socket = io();
+        socketRef.current = socket;
+
+        socket.on("connect", () => {
+            setWsConnected(true);
+        });
+
+        socket.on("disconnect", () => {
+            setWsConnected(false);
+        });
+
+        // Real-time progress listener
+        socket.on(
+            "downloadProgress",
+            (data: {
+                downloadId: string;
+                chunkId: string;
+                chunkDownloadedBytes: number;
+                downloadedBytes: number;
+                total: number
+            }) => {
+                // Handle download state adjustments
+                setDownloads((prev) =>
+                    prev.map((d) => {
+                        if (d.id === data.downloadId) {
+                            // Update aggregate metrics
+                            const updatedSize = data.downloadedBytes;
+
+                            // Calculate speed
+                            const now = Date.now();
+                            const lastState = lastProgressRef.current[data.downloadId] || {
+                                bytes: d.downloadedSize,
+                                time: now - 1000,
+                                speed: 0
+                            };
+                            const timeDiff = (now - lastState.time) / 1000; // seconds
+
+                            let currentSpeed = lastState.speed;
+                            if (timeDiff >= 0.5) { // Throttle calculations slightly to yield stable speed readouts
+                                const progressDiff = updatedSize - lastState.bytes;
+                                currentSpeed = Math.max(0, progressDiff / timeDiff);
+                                lastProgressRef.current[data.downloadId] = {
+                                    bytes: updatedSize,
+                                    time: now,
+                                    speed: currentSpeed
+                                };
+                            }
+
+                            // Update matching chunk
+                            const updatedChunks = (d.chunks || []).map((c) => {
+                                if (c.id === data.chunkId) {
+                                    const chunkTotalBytes = c.endByte ? c.endByte - c.startByte + 1 : null;
+                                    const isDone = chunkTotalBytes !== null && data.chunkDownloadedBytes >= chunkTotalBytes;
+                                    return {
+                                        ...c,
+                                        downloadedBytes: data.chunkDownloadedBytes,
+                                        status: (isDone ? "DONE" : "ACTIVE") as "ACTIVE" | "DONE",
+                                    };
+                                }
+                                return c;
+                            });
+
+                            return {
+                                ...d,
+                                downloadedSize: updatedSize,
+                                status: "DOWNLOADING" as const,
+                                chunks: updatedChunks,
+                            };
+                        }
+                        return d;
+                    })
+                );
+            }
+        );
+
+        // Forwarding specific server states
+        socket.on("downloadStarted", (id: string) => {
+            refreshItem(id);
+            fetchStats();
+        });
+
+        socket.on("downloadPaused", (id: string) => {
+            refreshItem(id);
+            fetchStats();
+        });
+
+        socket.on("downloadComplete", (id: string) => {
+            refreshItem(id);
+            fetchStats();
+        });
+
+        socket.on("downloadError", (id: string) => {
+            refreshItem(id);
+            fetchStats();
+        });
+
+        socket.on("downloadResumed", (id: string) => {
+            refreshItem(id);
+            fetchStats();
+        });
+
+        // Periodic stats polling
+        const timer = setInterval(() => {
+            fetchStats();
+        }, 5000);
+
+        return () => {
+            socket.disconnect();
+            clearInterval(timer);
+        };
+    }, []);
+
+    // Fetch functions
+    const fetchDownloads = async () => {
+        try {
+            const res = await fetch("/api/downloads");
+            if (res.ok) {
+                const data = await res.json();
+                setDownloads(data);
+            }
+        } catch (e) {
+            console.error("Could not fetch downloads list", e);
+        }
+    };
+
+    const fetchStats = async () => {
+        try {
+            const res = await fetch("/api/downloads/stats");
+            if (res.ok) {
+                const data = await res.json();
+                setStats(data);
+            }
+        } catch (e) {
+            console.error("Could not fetch database statistics", e);
+        }
+    };
+
+    const fetchSettings = async () => {
+        try {
+            const res = await fetch("/api/settings");
+            if (res.ok) {
+                const data = await res.json();
+                setSettings(data);
+            }
+        } catch (e) {
+            console.error("Could not fetch config settings", e);
+        }
+    };
+
+    const refreshItem = async (id: string) => {
+        try {
+            const res = await fetch(`/api/downloads`);
+            if (res.ok) {
+                const data: DownloadItem[] = await res.json();
+                const updated = data.find((d) => d.id === id);
+                if (updated) {
+                    setDownloads((prev) => prev.map((item) => (item.id === id ? {...updated} : item)));
+                } else {
+                    // If deleted
+                    setDownloads((prev) => prev.filter((item) => item.id !== id));
+                }
+            }
+        } catch (e) {
+            console.error("Refresh item failed", e);
+        }
+    };
+
+    // UI Interactive Triggers
+    const handlePause = async (id: string) => {
+        try {
+            await fetch(`/api/downloads/${id}/pause`, { method: "POST" });
+            refreshItem(id);
+        } catch (e) {
+            console.error("Pause job failure", e);
+        }
+    };
+
+    const handleResume = async (id: string) => {
+        try {
+            await fetch(`/api/downloads/${id}/resume`, { method: "POST" });
+            refreshItem(id);
+        } catch (e) {
+            console.error("Resume job failure", e);
+        }
+    };
+
+    const handleRetry = async (id: string) => {
+        try {
+            await fetch(`/api/downloads/${id}/retry`, { method: "POST" });
+            refreshItem(id);
+        } catch (e) {
+            console.error("Retry job failure", e);
+        }
+    };
+
+    const handleDelete = async (id: string) => {
+        if (!confirm("Are you sure you want to delete this download and clean its cache files?")) return;
+        try {
+            const res = await fetch(`/api/downloads/${id}`, { method: "DELETE" });
+            if (res.ok) {
+                setDownloads((prev) => prev.filter((d) => d.id !== id));
+                fetchStats();
+            }
+        } catch (e) {
+            console.error("Deletion task failed", e);
+        }
+    };
+
+    // Submit new download
+    const handleAddSubmit = async (e: FormEvent) => {
+        e.preventDefault();
+        if (!inputUrl) return;
+
+        try {
+            const res = await fetch("/api/downloads", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    url: inputUrl,
+                    filename: inputFilename,
+                    directory: inputDirectory,
+                    chunkCount: inputChunkCount,
+                    scheduledAt: inputScheduledAt,
+                }),
+            });
+
+            if (res.ok) {
+                setIsAddModalOpen(false);
+                // Clear forms
+                setInputUrl("");
+                setInputFilename("");
+                setInputDirectory("");
+                setInputChunkCount(4);
+                setInputScheduledAt("");
+
+                fetchDownloads();
+                fetchStats();
+            } else {
+                const err = await res.json();
+                alert(`Error queuing download: ${err.error || "Please verify credentials"}`);
+            }
+        } catch (e) {
+            console.error("Submit task failed", e);
+        }
+    };
+
+    // Save Settings
+    const handleSettingsSave = async (e: FormEvent) => {
+        e.preventDefault();
+        try {
+            const res = await fetch("/api/settings", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(settings),
+            });
+
+            if (res.ok) {
+                setIsSettingsModalOpen(false);
+                fetchDownloads();
+                fetchStats();
+            }
+        } catch (e) {
+            console.error("Could not persist configuration adjustments", e);
+        }
+    };
+
+    // Dynamic values computation
+    const filteredDownloads = useMemo(() => {
+        return downloads.filter((d) => {
+            // Tab filter
+            if (activeTab === "downloading" && d.status !== "DOWNLOADING") return false;
+            if (activeTab === "completed" && d.status !== "COMPLETED") return false;
+            if (activeTab === "scheduled" && d.status !== "SCHEDULED") return false;
+            if (activeTab === "error" && d.status !== "ERROR") return false;
+
+            // Search matching
+            const queryLower = searchQuery.toLowerCase();
+            return (
+                d.filename.toLowerCase().includes(queryLower) ||
+                d.url.toLowerCase().includes(queryLower) ||
+                d.directory.toLowerCase().includes(queryLower)
+            );
+        });
+    }, [downloads, activeTab, searchQuery]);
+
+    // General sizing helpers
+    const formatBytes = (bytes: number | null | undefined): string => {
+        if (bytes === null || bytes === undefined) return "Unknown size";
+        if (bytes === 0) return "0 B";
+        const k = 1024;
+        const sizes = ["B", "KB", "MB", "GB", "TB"];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+    };
+
+    const formatSpeed = (bytesPerSecond: number | undefined): string => {
+        if (!bytesPerSecond) return "0 B/s";
+        return formatBytes(bytesPerSecond) + "/s";
+    };
+
+    return (
+        <div id="app" className="min-h-screen bg-slate-950 text-slate-100 font-sans antialiased pb-20">
+            {/* 1. TOP HEADER NAVIGATION BAR */}
+            <header className="border-b border-slate-800 bg-slate-900/60 backdrop-blur sticky top-0 z-40 px-6 py-4">
+                <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+                    <div className="flex items-center gap-3">
+                        <div className="bg-emerald-500/15 text-emerald-400 p-2.5 rounded-xl border border-emerald-500/20 shadow-md">
+                            <Download className="w-6 h-6 animate-pulse" />
+                        </div>
+                        <div>
+                            <div className="flex items-center gap-2">
+                                <h1 className="font-sans font-bold text-xl tracking-tight text-white">
+                                    Fletch Downloader
+                                </h1>
+                                <span className="text-[10px] font-mono bg-emerald-500/10 border border-emerald-400/20 text-emerald-400 px-2 py-0.5 rounded-full uppercase tracking-wider">
+                  v2.0 Fullstack
+                </span>
+                            </div>
+                            <p className="text-xs text-slate-400 mt-0.5">Multiparts Smart Downloading Engine</p>
+                        </div>
+                    </div>
+
+                    <div className="flex items-center flex-wrap gap-3">
+                        {/* Server Connection Badge */}
+                        <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300">
+                            <div className={`w-2.5 h-2.5 rounded-full ${wsConnected ? "bg-emerald-400 animate-ping" : "bg-rose-400"}`} />
+                            <span className="font-mono text-[11px]">
+                {wsConnected ? "Live Socket Active" : "Socket Reconnecting"}
+              </span>
+                        </div>
+
+                        {/* Guide Button */}
+                        <button
+                            onClick={() => setIsGuideOpen(true)}
+                            className="btn flex items-center gap-2 border border-slate-700 hover:border-slate-600 bg-slate-800 text-slate-300 hover:text-white text-xs px-3 py-1.5 rounded-lg transition"
+                        >
+                            <HelpCircle className="w-4 h-4" />
+                            <span>Firefox Integration</span>
+                        </button>
+
+                        {/* Config Button */}
+                        <button
+                            onClick={() => setIsSettingsModalOpen(true)}
+                            className="btn flex items-center gap-2 border border-slate-700 hover:border-slate-600 bg-slate-800 text-slate-300 hover:text-white text-xs px-3 py-1.5 rounded-lg transition"
+                        >
+                            <Settings className="w-4 h-4" />
+                            <span>Settings</span>
+                        </button>
+
+                        {/* New Task Trigger */}
+                        <button
+                            onClick={() => setIsAddModalOpen(true)}
+                            className="btn flex items-center gap-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs px-4 py-2 rounded-lg transition shadow-lg shadow-emerald-500/10"
+                        >
+                            <Plus className="w-4 h-4" />
+                            <span>Add Download</span>
+                        </button>
+                    </div>
+                </div>
+            </header>
+
+            <main className="max-w-7xl mx-auto px-6 mt-8">
+                {/* 2. STATS OVERVIEW BENTO GRID */}
+                <section className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+                    <div className="bg-slate-900 border border-slate-800/80 rounded-2xl p-5 shadow-sm relative overflow-hidden">
+                        <div className="absolute top-0 right-0 p-5 opacity-5 text-white">
+                            <Download className="w-16 h-16" />
+                        </div>
+                        <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Active Concurrency Dev</p>
+                        <h3 className="font-sans font-bold text-3xl text-white mt-1.5">{stats.activeThreads} <span className="text-xs text-slate-400">threads</span></h3>
+                        <p className="text-xs text-emerald-400 mt-2 flex items-center gap-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                            Processing tasks simultaneously
+                        </p>
+                    </div>
+
+                    <div className="bg-slate-900 border border-slate-800/80 rounded-2xl p-5 shadow-sm relative overflow-hidden">
+                        <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Completed Downloads</p>
+                        <h3 className="font-sans font-bold text-3xl text-white mt-1.5">{stats.completedCount} <span className="text-xs text-slate-400">/ {stats.totalDownloads}</span></h3>
+                        <p className="text-xs text-slate-400 mt-2">
+                            Finished files saved securely
+                        </p>
+                    </div>
+
+                    <div className="bg-slate-900 border border-slate-800/80 rounded-2xl p-5 shadow-sm relative overflow-hidden">
+                        <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Aggregate File Size</p>
+                        <h3 className="font-sans font-bold text-3xl text-white mt-1.5">{formatBytes(stats.totalSize)}</h3>
+                        <p className="text-xs text-slate-400 mt-2">
+                            Including partial buffers
+                        </p>
+                    </div>
+
+                    <div className="bg-slate-900 border border-slate-800/80 rounded-2xl p-5 shadow-sm relative overflow-hidden">
+                        <p className="text-xs font-medium text-slate-400 uppercase tracking-wider font-semibold">Total Storage Bound</p>
+                        <h3 className="font-sans font-bold text-3xl text-sky-400 mt-1.5">{formatBytes(stats.totalDownloaded)}</h3>
+                        <p className="text-xs text-slate-400 mt-2">
+                            Actual disk allocation used
+                        </p>
+                    </div>
+                </section>
+
+                {/* 3. TASK CONTROLLER BAR (Filter & Search) */}
+                <section className="bg-slate-900 border border-slate-800 rounded-2xl p-4 mb-6 flex flex-col md:flex-row items-center gap-4 justify-between">
+                    {/* Tabs Filter */}
+                    <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800/60 overflow-x-auto w-full md:w-auto">
+                        {(["all", "downloading", "completed", "scheduled", "error"] as const).map((tab) => (
+                            <button
+                                key={tab}
+                                onClick={() => setActiveTab(tab)}
+                                className={`px-4 py-2 text-xs font-medium rounded-lg transition capitalize whitespace-nowrap ${
+                                    activeTab === tab
+                                        ? "bg-slate-800 text-white font-semibold shadow-sm"
+                                        : "text-slate-400 hover:text-slate-200"
+                                }`}
+                            >
+                                {tab}
+                            </button>
+                        ))}
+                    </div>
+
+                    {/* Search box */}
+                    <div className="relative w-full md:w-80">
+                        <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                        <input
+                            type="text"
+                            placeholder="Search downloads by filename..."
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            className="w-full bg-slate-950 border border-slate-800/80 focus:border-slate-600 text-slate-100 text-xs px-10 py-2.5 rounded-xl outline-none transition"
+                        />
+                    </div>
+                </section>
+
+                {/* 4. MAIN DOWNLOADS LIST CONTAINER */}
+                <section className="space-y-4">
+                    <AnimatePresence mode="popLayout">
+                        {filteredDownloads.length === 0 ? (
+                            <motion.div
+                                initial={{ opacity: 0, y: 10 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0 }}
+                                className="bg-slate-900/40 border border-dashed border-slate-800 rounded-2xl p-12 text-center"
+                            >
+                                <div className="mx-auto w-12 h-12 bg-slate-800/60 rounded-xl flex items-center justify-center text-slate-400 border border-slate-700 mb-4">
+                                    <Download className="w-5 h-5" />
+                                </div>
+                                <h4 className="font-semibold text-slate-200 text-sm">No download records found</h4>
+                                <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
+                                    Try adding a target download link or checking other tabs for active/completed/scheduled items.
+                                </p>
+                            </motion.div>
+                        ) : (
+                            filteredDownloads.map((item) => {
+                                const isExpanded = expandedId === item.id;
+                                const progressPercent = item.totalSize
+                                    ? Math.min(100, Math.round((item.downloadedSize / item.totalSize) * 100))
+                                    : 0;
+
+                                const trackingSpeed = lastProgressRef.current[item.id]?.speed || 0;
+
+                                return (
+                                    <motion.div
+                                        key={item.id}
+                                        layout
+                                        initial={{ opacity: 0, y: 10 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        exit={{ opacity: 0 }}
+                                        transition={{ duration: 0.2 }}
+                                        className={`bg-slate-900 border transition-all ${
+                                            isExpanded ? "border-slate-700 ring-1 ring-slate-800" : "border-slate-800 hover:border-slate-700"
+                                        } rounded-2xl overflow-hidden`}
+                                    >
+                                        {/* CARD BODY HEADER */}
+                                        <div className="p-4 md:p-5 flex flex-col md:flex-row items-center justify-between gap-4">
+                                            <div className="flex items-start gap-4 w-full md:w-3/5">
+                                                {/* Status Icon Indicator */}
+                                                <div className="mt-1">
+                                                    {item.status === "COMPLETED" && (
+                                                        <div className="bg-emerald-500/10 text-emerald-405 p-2 rounded-lg border border-emerald-500/10">
+                                                            <CheckCircle className="w-5 h-5 text-emerald-400" />
+                                                        </div>
+                                                    )}
+                                                    {item.status === "DOWNLOADING" && (
+                                                        <div className="bg-sky-500/10 text-sky-400 p-2 rounded-lg border border-sky-500/10 animate-pulse">
+                                                            <Cpu className="w-5 h-5 text-sky-400" />
+                                                        </div>
+                                                    )}
+                                                    {item.status === "PAUSED" && (
+                                                        <div className="bg-zinc-500/10 text-zinc-400 p-2 rounded-lg border border-zinc-500/10">
+                                                            <Pause className="w-5 h-5 text-zinc-400" />
+                                                        </div>
+                                                    )}
+                                                    {item.status === "SCHEDULED" && (
+                                                        <div className="bg-amber-500/10 text-amber-450 p-2 rounded-lg border border-amber-500/10">
+                                                            <Clock className="w-5 h-5 text-amber-400" />
+                                                        </div>
+                                                    )}
+                                                    {item.status === "ERROR" && (
+                                                        <div className="bg-rose-500/10 text-rose-450 p-2 rounded-lg border border-rose-500/10">
+                                                            <AlertTriangle className="w-5 h-5 text-rose-500" />
+                                                        </div>
+                                                    )}
+                                                    {item.status === "PENDING" && (
+                                                        <div className="bg-slate-800 text-slate-400 p-2 rounded-lg border border-slate-700">
+                                                            <Clock className="w-5 h-5" />
+                                                        </div>
+                                                    )}
+                                                </div>
+
+                                                {/* File Details */}
+                                                <div className="min-w-0 flex-1">
+                                                    <h4 className="font-semibold text-white text-sm truncate uppercase tracking-wide">
+                                                        {item.filename}
+                                                    </h4>
+                                                    <p className="text-xs text-slate-400 truncate mt-0.5 flex items-center gap-1.5">
+                                                        <Link className="w-3.5 h-3.5 shrink-0 text-slate-500" />
+                                                        <span className="truncate hover:text-slate-300 transition" title={item.url}>
+                              {item.url}
+                            </span>
+                                                    </p>
+                                                    <div className="flex flex-wrap items-center gap-2 mt-2">
+                            <span className="text-[10px] font-mono bg-slate-950 border border-slate-800 text-slate-400 px-2 py-0.5 rounded-md flex items-center gap-1">
+                              <Folder className="w-3 h-3 text-slate-500" />
+                                {item.directory || "downloads"}
+                            </span>
+                                                        <span className="text-[10px] font-mono bg-slate-950 border border-slate-800 text-slate-400 px-2 py-0.5 rounded-md">
+                              {item.chunkCount} {item.chunkCount > 1 ? "slices" : "slice"}
+                            </span>
+                                                        {item.scheduledAt && (
+                                                            <span className="text-[10px] font-mono bg-amber-500/5 border border-amber-500/10 text-amber-400 px-2 py-0.5 rounded-md flex items-center gap-1">
+                                <Clock className="w-3 h-3 text-amber-500" />
+                                Sch: {new Date(item.scheduledAt).toLocaleString()}
+                              </span>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            {/* Right Sizing & Progressive info */}
+                                            <div className="w-full md:w-2/5 flex flex-col items-stretch md:items-end justify-between gap-3 text-right">
+                                                <div className="flex items-center justify-between md:justify-end gap-6 w-full">
+                                                    {/* Sizes / Slices info */}
+                                                    <div className="text-left md:text-right">
+                            <span className="text-xs text-slate-450 block font-medium">
+                              {formatBytes(item.downloadedSize)} of {formatBytes(item.totalSize)}
+                            </span>
+                                                        <span className="text-[11px] text-slate-500 font-mono block mt-0.5">
+                              {item.status === "DOWNLOADING" && `Speed: ${formatSpeed(trackingSpeed)}`}
+                                                            {item.status === "COMPLETED" && "Completed downloading successfully"}
+                                                            {item.status === "PAUSED" && "Paused"}
+                                                            {item.status === "ERROR" && "Downloading failed with errors"}
+                                                            {item.status === "SCHEDULED" && "Awaiting scheduled timestamp"}
+                                                            {item.status === "PENDING" && "Waiting in task queue..."}
+                            </span>
+                                                    </div>
+
+                                                    {/* Percent Indicator ring/block */}
+                                                    <div className="text-right">
+                            <span className="text-lg font-mono font-bold text-white">
+                              {progressPercent}%
+                            </span>
+                                                    </div>
+                                                </div>
+
+                                                {/* Action buttons list */}
+                                                <div className="flex items-center justify-end gap-2 w-full mt-1.5 border-t border-slate-800/40 md:border-0 pt-3 md:pt-0">
+                                                    {/* Toggle expand slices map */}
+                                                    <button
+                                                        onClick={() => setExpandedId(isExpanded ? null : item.id)}
+                                                        className="btn hover:bg-slate-800 text-slate-400 hover:text-slate-200 p-2 rounded-lg transition"
+                                                        title="Inspect multi-chunk parallel slots progress"
+                                                    >
+                                                        {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                                                    </button>
+
+                                                    {/* Pause and Play logic triggers */}
+                                                    {item.status === "DOWNLOADING" && (
+                                                        <button
+                                                            onClick={() => handlePause(item.id)}
+                                                            className="btn bg-slate-800 border border-slate-700 hover:border-slate-600 text-slate-300 hover:bg-slate-700 p-2 rounded-lg transition"
+                                                            title="Pause download task"
+                                                        >
+                                                            <Pause className="w-4 h-4" />
+                                                        </button>
+                                                    )}
+                                                    {(item.status === "PAUSED" || item.status === "PENDING") && (
+                                                        <button
+                                                            onClick={() => handleResume(item.id)}
+                                                            className="btn bg-sky-500/10 hover:bg-sky-500/20 text-sky-450 border border-sky-500/20 p-2 rounded-lg transition"
+                                                            title="Resume download task"
+                                                        >
+                                                            <Play className="w-4 h-4 text-sky-400" />
+                                                        </button>
+                                                    )}
+
+                                                    {item.status === "ERROR" && (
+                                                        <button
+                                                            onClick={() => handleRetry(item.id)}
+                                                            className="btn bg-amber-500/10 hover:bg-amber-500/20 text-amber-450 border border-amber-500/20 p-2 rounded-lg transition"
+                                                            title="Retry connection/download"
+                                                        >
+                                                            <RotateCcw className="w-4 h-4 text-amber-400" />
+                                                        </button>
+                                                    )}
+
+                                                    {/* Delete Item always safe */}
+                                                    <button
+                                                        onClick={() => handleDelete(item.id)}
+                                                        className="btn bg-slate-800 border border-slate-700 hover:bg-rose-950 hover:border-rose-900 border-slate-700 hover:text-rose-450 text-slate-400 p-2 rounded-lg transition"
+                                                        title="Remove download record"
+                                                    >
+                                                        <Trash2 className="w-4 h-4" />
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* Progress slider bar */}
+                                        <div className="h-1 w-full bg-slate-950 relative overflow-hidden">
+                                            <div
+                                                style={{ width: `${progressPercent}%` }}
+                                                className={`h-full transition-all duration-300 ${
+                                                    item.status === "COMPLETED"
+                                                        ? "bg-emerald-550 bg-gradient-to-r from-emerald-500 to-teal-500"
+                                                        : item.status === "ERROR"
+                                                            ? "bg-rose-500"
+                                                            : item.status === "PAUSED"
+                                                                ? "bg-zinc-500"
+                                                                : "bg-sky-500 bg-gradient-to-r from-sky-500 to-emerald-500 animate-pulse"
+                                                }`}
+                                            />
+                                        </div>
+
+                                        {/* EXPANDED INTERACTIVE SLICES MAP */}
+                                        <AnimatePresence>
+                                            {isExpanded && (
+                                                <motion.div
+                                                    initial={{ height: 0, opacity: 0 }}
+                                                    animate={{ height: "auto", opacity: 1 }}
+                                                    exit={{ height: 0, opacity: 0 }}
+                                                    transition={{ duration: 0.2 }}
+                                                    className="bg-slate-950/60 border-t border-slate-800/80 px-5 py-4"
+                                                >
+                                                    <div className="flex items-center justify-between mb-3">
+                                                        <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-350 tracking-wider uppercase">
+                                                            <Cpu className="w-3.5 h-3.5 text-sky-400" />
+                                                            <span>Direct Byte Chunks Allocation Map (Parallel Slices)</span>
+                                                        </div>
+                                                        <span className="text-[10px] font-mono text-slate-500">
+                              Each chunk stream operates concurrently in secondary threads
+                            </span>
+                                                    </div>
+
+                                                    {/* Parallel meters container */}
+                                                    {(!item.chunks || item.chunks.length === 0) ? (
+                                                        <p className="text-xs text-slate-500 font-mono italic">
+                                                            Initial download ranges are calculated dynamically when downloading initiates.
+                                                        </p>
+                                                    ) : (
+                                                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+                                                            {item.chunks.map((ch, idx) => {
+                                                                const chunkTotalBytes = ch.endByte ? ch.endByte - ch.startByte + 1 : null;
+                                                                const chunkPercent = chunkTotalBytes
+                                                                    ? Math.min(100, Math.round((ch.downloadedBytes / chunkTotalBytes) * 100))
+                                                                    : ch.status === "DONE"
+                                                                        ? 100
+                                                                        : 0;
+
+                                                                return (
+                                                                    <div
+                                                                        key={ch.id}
+                                                                        className="bg-slate-900 border border-slate-800/60 p-3 rounded-xl flex flex-col justify-between"
+                                                                    >
+                                                                        <div className="flex items-center justify-between text-[10px] font-mono mb-1.5">
+                                                                            <span className="text-slate-400 font-bold">Slice-{(idx + 1)}</span>
+                                                                            <span
+                                                                                className={`px-1.5 py-0.5 rounded text-[9px] ${
+                                                                                    ch.status === "DONE"
+                                                                                        ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/10"
+                                                                                        : ch.status === "ACTIVE"
+                                                                                            ? "bg-sky-500/10 text-sky-400 border border-sky-400/20"
+                                                                                            : "bg-slate-950 text-slate-500"
+                                                                                }`}
+                                                                            >
+                                        {ch.status}
+                                      </span>
+                                                                        </div>
+
+                                                                        {/* Inline visual meters */}
+                                                                        <div className="space-y-1">
+                                                                            <div className="flex items-center justify-between text-[10px] text-slate-500 font-mono">
+                                                                                <span>{formatBytes(ch.downloadedBytes)}</span>
+                                                                                <span>
+                                          {chunkTotalBytes ? `${chunkPercent}%` : "Streaming"}
+                                        </span>
+                                                                            </div>
+                                                                            <div className="h-1.5 w-full bg-slate-950 rounded-full overflow-hidden">
+                                                                                <div
+                                                                                    style={{ width: `${chunkPercent}%` }}
+                                                                                    className={`h-full rounded-full transition-all duration-300 ${
+                                                                                        ch.status === "DONE" ? "bg-emerald-500" : "bg-sky-400"
+                                                                                    }`}
+                                                                                />
+                                                                            </div>
+                                                                            <div className="text-[9px] text-slate-500/80 font-mono text-center pt-1 truncate">
+                                                                                Range: {ch.startByte} - {ch.endByte ? ch.endByte : "EOF"}
+                                                                            </div>
+                                                                        </div>
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    )}
+                                                </motion.div>
+                                            )}
+                                        </AnimatePresence>
+                                    </motion.div>
+                                );
+                            })
+                        )}
+                    </AnimatePresence>
+                </section>
+            </main>
+
+            {/* 5. ADD TASK MODAL DIALOG */}
+            <AnimatePresence>
+                {isAddModalOpen && (
+                    <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <motion.div
+                            initial={{ scale: 0.95, opacity: 0 }}
+                            animate={{ scale: 1, opacity: 1 }}
+                            exit={{ scale: 0.95, opacity: 0 }}
+                            className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-xl overflow-hidden shadow-2xl relative"
+                        >
+                            <div className="p-6 border-b border-slate-800">
+                                <div className="flex items-center gap-2">
+                                    <div className="bg-emerald-500/10 text-emerald-400 p-2 rounded-xl border border-emerald-500/10">
+                                        <Plus className="w-5 h-5 text-emerald-400" />
+                                    </div>
+                                    <div>
+                                        <h3 className="font-sans font-bold text-lg text-white">Create New Download Task</h3>
+                                        <p className="text-xs text-slate-400 mt-0.5">Initialize a single or multithreaded downloading pipeline</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <form onSubmit={handleAddSubmit} className="p-6 space-y-4">
+                                {/* Destination URL */}
+                                <div className="form-control">
+                                    <label className="text-xs font-semibold text-slate-300 uppercase tracking-widest flex items-center gap-1">
+                                        Target Resource Link <span className="text-rose-500">*</span>
+                                    </label>
+                                    <input
+                                        type="url"
+                                        placeholder="https://example.com/files/document.pdf"
+                                        value={inputUrl}
+                                        onChange={(e) => setInputUrl(e.target.value)}
+                                        required
+                                        className="w-full bg-slate-950 border border-slate-800 focus:border-slate-600 text-slate-100 text-xs px-4 py-3 rounded-xl outline-none transition"
+                                    />
+                                </div>
+
+                                {/* Target Filename (Optional) */}
+                                <div className="form-control">
+                                    <label className="text-xs font-semibold text-slate-300 uppercase tracking-widest block mb-1.5">
+                                        Descriptive Filename (Optional)
+                                    </label>
+                                    <input
+                                        type="text"
+                                        placeholder="Auto-populated from URL if left empty"
+                                        value={inputFilename}
+                                        onChange={(e) => setInputFilename(e.target.value)}
+                                        className="w-full bg-slate-950 border border-slate-800 focus:border-slate-600 text-slate-100 text-xs px-4 py-3 rounded-xl outline-none transition"
+                                    />
+                                </div>
+
+                                {/* Extra parameters Grid */}
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    {/* Destination Directory */}
+                                    <div className="form-control">
+                                        <label className="text-xs font-semibold text-slate-300 uppercase tracking-widest block mb-1.5">
+                                            Relative Directory Path
+                                        </label>
+                                        <input
+                                            type="text"
+                                            placeholder="e.g. video / documents"
+                                            value={inputDirectory}
+                                            onChange={(e) => setInputDirectory(e.target.value)}
+                                            className="w-full bg-slate-950 border border-slate-800 focus:border-slate-600 text-slate-100 text-xs px-4 py-3 rounded-xl outline-none transition font-sans"
+                                        />
+                                    </div>
+
+                                    {/* Splits Chunks */}
+                                    <div className="form-control">
+                                        <label className="text-xs font-semibold text-slate-300 uppercase tracking-widest block mb-1.5">
+                                            Split Partition Connections
+                                        </label>
+                                        <input
+                                            type="number"
+                                            min="1"
+                                            max="16"
+                                            value={inputChunkCount}
+                                            onChange={(e) => setInputChunkCount(parseInt(e.target.value, 10))}
+                                            className="w-full bg-slate-950 border border-slate-800 focus:border-slate-600 text-slate-100 text-xs px-4 py-3 rounded-xl outline-none transition"
+                                        />
+                                    </div>
+                                </div>
+
+                                {/* Schedule details */}
+                                <div className="form-control">
+                                    <label className="text-xs font-semibold text-slate-300 uppercase tracking-widest block mb-1.5">
+                                        Smart Download Schedule (Optional)
+                                    </label>
+                                    <input
+                                        type="datetime-local"
+                                        value={inputScheduledAt}
+                                        onChange={(e) => setInputScheduledAt(e.target.value)}
+                                        className="w-full bg-slate-950 border border-slate-800 focus:border-slate-600 text-slate-100 text-xs px-4 py-3 rounded-xl outline-none transition"
+                                    />
+                                    <span className="text-[10px] text-slate-500 block mt-1">
+                    Set a future calendar date. Great for auto-enqueuing files at night.
+                  </span>
+                                </div>
+
+                                {/* Action buttons footer */}
+                                <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-800">
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsAddModalOpen(false)}
+                                        className="btn bg-slate-800 border border-slate-700 hover:border-slate-600 text-slate-300 text-xs px-4 py-2.5 rounded-xl transition"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        type="submit"
+                                        className="btn bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs px-5 py-2.5 rounded-xl transition"
+                                    >
+                                        Launch Queue
+                                    </button>
+                                </div>
+                            </form>
+                        </motion.div>
+                    </div>
+                )}
+            </AnimatePresence>
+
+            {/* 6. SETTINGS MODAL DIALOG */}
+            <AnimatePresence>
+                {isSettingsModalOpen && (
+                    <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <motion.div
+                            initial={{ scale: 0.95, opacity: 0 }}
+                            animate={{ scale: 1, opacity: 1 }}
+                            exit={{ scale: 0.95, opacity: 0 }}
+                            className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md overflow-hidden shadow-2xl"
+                        >
+                            <div className="p-6 border-b border-slate-800 flex items-center gap-2">
+                                <div className="bg-slate-800 text-slate-300 p-2 rounded-xl">
+                                    <Settings className="w-5 h-5" />
+                                </div>
+                                <div>
+                                    <h3 className="font-sans font-bold text-lg text-white">System Settings</h3>
+                                    <p className="text-xs text-slate-400 mt-0.5">Adjust downloader backend parameters</p>
+                                </div>
+                            </div>
+
+                            <form onSubmit={handleSettingsSave} className="p-6 space-y-4">
+                                <div className="form-control">
+                                    <label className="text-xs font-semibold text-slate-300 uppercase tracking-widest block mb-1.5">
+                                        Storage Downloads Directory
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={settings.downloadDirectory}
+                                        onChange={(e) => setSettings({ ...settings, downloadDirectory: e.target.value })}
+                                        required
+                                        className="w-full bg-slate-950 border border-slate-800 focus:border-slate-600 text-slate-100 text-xs px-4 py-3 rounded-xl outline-none transition"
+                                    />
+                                    <span className="text-[10px] text-slate-550 block mt-1 text-slate-500">
+                    Disk directory where packages and completed downloads are stored.
+                  </span>
+                                </div>
+
+                                <div className="form-control">
+                                    <label className="text-xs font-semibold text-slate-300 uppercase tracking-widest block mb-1.5">
+                                        Max Concurrent Download Jobs
+                                    </label>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        max="10"
+                                        value={settings.maxConcurrentTasks}
+                                        onChange={(e) => setSettings({ ...settings, maxConcurrentTasks: parseInt(e.target.value, 10) })}
+                                        required
+                                        className="w-full bg-slate-950 border border-slate-800 focus:border-slate-600 text-slate-100 text-xs px-4 py-3 rounded-xl outline-none transition"
+                                    />
+                                    <span className="text-[10px] text-slate-500 block mt-1">
+                    Limits parallel downloads. Higher is faster, lower reduces congestion.
+                  </span>
+                                </div>
+
+                                <div className="form-control">
+                                    <label className="text-xs font-semibold text-slate-300 uppercase tracking-widest block mb-1.5">
+                                        Default Chunk Splitting Ratio
+                                    </label>
+                                    <input
+                                        type="number"
+                                        min="1"
+                                        max="16"
+                                        value={settings.defaultChunkCount}
+                                        onChange={(e) => setSettings({ ...settings, defaultChunkCount: parseInt(e.target.value, 10) })}
+                                        required
+                                        className="w-full bg-slate-950 border border-slate-800 focus:border-slate-600 text-slate-100 text-xs px-4 py-3 rounded-xl outline-none transition"
+                                    />
+                                </div>
+
+                                <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-800">
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsSettingsModalOpen(false)}
+                                        className="btn bg-slate-800 border border-slate-700 hover:border-slate-600 text-slate-300 text-xs px-4 py-2.5 rounded-xl transition"
+                                    >
+                                        Close
+                                    </button>
+                                    <button
+                                        type="submit"
+                                        className="btn bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs px-5 py-2.5 rounded-xl transition"
+                                    >
+                                        Save Changes
+                                    </button>
+                                </div>
+                            </form>
+                        </motion.div>
+                    </div>
+                )}
+            </AnimatePresence>
+
+            {/* 7. EXTENSION USERS GUIDE MODAL */}
+            <AnimatePresence>
+                {isGuideOpen && (
+                    <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <motion.div
+                            initial={{ scale: 0.95, opacity: 0 }}
+                            animate={{ scale: 1, opacity: 1 }}
+                            exit={{ scale: 0.95, opacity: 0 }}
+                            className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-lg overflow-hidden shadow-2xl"
+                        >
+                            <div className="p-6 border-b border-slate-800 flex items-center gap-2">
+                                <div className="bg-emerald-500/10 text-emerald-400 p-2 rounded-xl">
+                                    <ExternalLink className="w-5 h-5 text-emerald-400" />
+                                </div>
+                                <div>
+                                    <h3 className="font-sans font-bold text-lg text-white">Browser Extension Integration</h3>
+                                    <p className="text-xs text-slate-400 mt-0.5">Integrate right-click download helpers instantly</p>
+                                </div>
+                            </div>
+
+                            <div className="p-6 space-y-4 text-xs leading-relaxed text-slate-300">
+                                <p>
+                                    <strong>Fletch Downloader</strong> includes a silent API endpoint that intercepts links sent by browser extensions (like Firefox Custom Actions or Chrome Context Menu triggers) specifically tailored to catch your:
+                                </p>
+
+                                <div className="bg-slate-950 text-slate-300 p-3 rounded-xl border border-slate-800/80 font-mono text-[11px] block text-center">
+                                    http://localhost:3000/?url=URL_TO_DOWNLOAD
+                                </div>
+
+                                <h4 className="font-bold text-white text-xs uppercase tracking-wider pt-2">
+                                    How to configure Firefox Right-Click extension:
+                                </h4>
+                                <ol className="list-decimal pl-4 space-y-2">
+                                    <li>
+                                        Open your Firefox Right-Click custom action extension preferences.
+                                    </li>
+                                    <li>
+                                        Register a new custom Right-Click menu option, named e.g.,{" "}
+                                        <span className="text-emerald-400">"Downloader Grab Link"</span>.
+                                    </li>
+                                    <li>
+                                        Set the target redirect API action path to forward the selected hyperlink directly to:
+                                        <br />
+                                        <code className="text-[11px] text-sky-455 font-mono select-all bg-slate-950 px-2 py-1 rounded inline-block mt-1 text-sky-400 border border-slate-800">
+                                            http://localhost:3000/?url=%s
+                                        </code>
+                                        <br />
+                                        <span className="text-[10px] text-slate-500">
+                      (Where <code className="font-mono">%s</code> corresponds to the right-clicked target URL placeholder)
+                    </span>
+                                    </li>
+                                    <li>
+                                        Now, right-click on any hyperlink on any online page and click "Downloader Grab Link".
+                                        The link will be processed and enqueued silently into your download dashboard immediately!
+                                    </li>
+                                </ol>
+
+                                <div className="flex items-center justify-end pt-4 border-t border-slate-800">
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsGuideOpen(false)}
+                                        className="btn bg-slate-800 hover:bg-slate-700 text-white font-medium text-xs px-5 py-2.5 rounded-xl transition"
+                                    >
+                                        Understood
+                                    </button>
+                                </div>
+                            </div>
+                        </motion.div>
+                    </div>
+                )}
+            </AnimatePresence>
+        </div>
+    );
+}
+```
+
+src/index.css:
+```
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+    --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+```
+
+src/main.tsx:
+```
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { App } from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+        <App />
+    </StrictMode>,
+);
+```
+
+src/server/db.ts:
+```
+import pg from "pg";
+import { v4 as uuidv4 } from "uuid";
+import fs from "fs";
+import path from "path";
+
+const { Pool } = pg;
+
+const DATABASE_URL = process.env.DATABASE_URL || "postgresql://postgres:2@localhost:5432/download_manager";
+const FALLBACK_FILE = path.resolve(process.cwd(), "downloads_fallback_db.json");
+
+// Define TypeScript interfaces for our database records
+export interface DownloadRecord {
+    id: string;
+    url: string;
+    filename: string;
+    directory: string;
+    totalSize: number | null;
+    downloadedSize: number;
+    chunkCount: number;
+    status: "PENDING" | "DOWNLOADING" | "PAUSED" | "COMPLETED" | "ERROR" | "SCHEDULED";
+    scheduledAt: string | null;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface ChunkRecord {
+    id: string;
+    downloadId: string;
+    index: number;
+    startByte: number;
+    endByte: number | null;
+    downloadedBytes: number;
+    status: "PENDING" | "ACTIVE" | "DONE" | "ERROR";
+}
+
+export interface SettingRecord {
+    key: string;
+    value: any;
+}
+
+interface MockDB {
+    downloads: DownloadRecord[];
+    chunks: ChunkRecord[];
+    settings: Record<string, any>;
+}
+
+// In-memory or file-backed database emulator
+class LocalFallbackDB {
+    private data: MockDB = { downloads: [], chunks: [], settings: {} };
+
+    constructor() {
+        this.load();
+        // Set some defaults
+        if (!this.data.settings.downloadDirectory) {
+            this.data.settings.downloadDirectory = "./downloads";
+        }
+        if (!this.data.settings.maxConcurrentTasks) {
+            this.data.settings.maxConcurrentTasks = 3;
+        }
+    }
+
+    private load() {
+        try {
+            if (fs.existsSync(FALLBACK_FILE)) {
+                const fileContent = fs.readFileSync(FALLBACK_FILE, "utf-8");
+                this.data = JSON.parse(fileContent);
+            }
+        } catch (e) {
+            console.warn("Could not load fallback DB, resetting...", e);
+        }
+    }
+
+    private save() {
+        try {
+            fs.writeFileSync(FALLBACK_FILE, JSON.stringify(this.data, null, 2));
+        } catch (e) {
+            console.error("Could not save fallback DB:", e);
+        }
+    }
+
+    public getDownloads(): DownloadRecord[] {
+        return this.data.downloads;
+    }
+
+    public getDownload(id: string): DownloadRecord | null {
+        return this.data.downloads.find((d) => d.id === id) || null;
+    }
+
+    public insertDownload(d: Omit<DownloadRecord, "createdAt" | "updatedAt">): DownloadRecord {
+        const now = new Date().toISOString();
+        const record: DownloadRecord = {
+            ...d,
+            createdAt: now,
+            updatedAt: now,
+        };
+        this.data.downloads.push(record);
+        this.save();
+        return record;
+    }
+
+    public updateDownload(id: string, updates: Partial<DownloadRecord>): DownloadRecord | null {
+        const idx = this.data.downloads.findIndex((d) => d.id === id);
+        if (idx === -1) return null;
+        const now = new Date().toISOString();
+        this.data.downloads[idx] = {
+            ...this.data.downloads[idx],
+            ...updates,
+            updatedAt: now,
+        };
+        this.save();
+        return this.data.downloads[idx];
+    }
+
+    public deleteDownload(id: string) {
+        this.data.downloads = this.data.downloads.filter((d) => d.id !== id);
+        this.data.chunks = this.data.chunks.filter((c) => c.downloadId !== id);
+        this.save();
+    }
+
+    public getChunks(downloadId: string): ChunkRecord[] {
+        return this.data.chunks.filter((c) => c.downloadId === downloadId);
+    }
+
+    public getChunk(downloadId: string, index: number): ChunkRecord | null {
+        return this.data.chunks.find((c) => c.downloadId === downloadId && c.index === index) || null;
+    }
+
+    public insertChunk(c: ChunkRecord): ChunkRecord {
+        this.data.chunks.push(c);
+        this.save();
+        return c;
+    }
+
+    public updateChunk(id: string, updates: Partial<ChunkRecord>): ChunkRecord | null {
+        const idx = this.data.chunks.findIndex((c) => c.id === id);
+        if (idx === -1) return null;
+        this.data.chunks[idx] = {
+            ...this.data.chunks[idx],
+            ...updates,
+        };
+        this.save();
+        return this.data.chunks[idx];
+    }
+
+    public getSetting(key: string): any {
+        return this.data.settings[key] ?? null;
+    }
+
+    public setSetting(key: string, value: any) {
+        this.data.settings[key] = value;
+        this.save();
+    }
+}
+
+const fallbackDb = new LocalFallbackDB();
+
+let isPostgresAvailable = false;
+let pool: any = null;
+
+// Convert snake_case from Postgres to camelCase to match TS types row by row, supporting nested structures
+function toCamel(row: any): any {
+    if (!row) return row;
+    if (Array.isArray(row)) {
+        return row.map(toCamel);
+    }
+    if (typeof row === "object") {
+        const result: any = {};
+        for (const [key, value] of Object.entries(row)) {
+            const camelKey = key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+            let convertedValue = value;
+            if (typeof value === "bigint") {
+                convertedValue = Number(value);
+            } else if (value !== null && typeof value === "object") {
+                convertedValue = toCamel(value);
+            }
+            result[camelKey] = convertedValue;
+        }
+        return result;
+    }
+    return row;
+}
+
+export async function initializeDatabase() {
+    console.log("Checking database connection to:", DATABASE_URL);
+    pool = new Pool({
+        connectionString: DATABASE_URL,
+        connectionTimeoutMillis: 3000, // Quick timeout to handle sandbox environment
+    });
+
+    try {
+        const client = await pool.connect();
+        console.log("PostgreSQL connection verified successfully!");
+        isPostgresAvailable = true;
+
+        // Create required tables if they do not exist
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS downloads (
+                                                     id TEXT PRIMARY KEY,
+                                                     url TEXT NOT NULL,
+                                                     filename TEXT NOT NULL,
+                                                     directory TEXT NOT NULL,
+                                                     total_size BIGINT,
+                                                     downloaded_size BIGINT DEFAULT 0,
+                                                     chunk_count INTEGER DEFAULT 1,
+                                                     status TEXT DEFAULT 'PENDING',
+                                                     scheduled_at TIMESTAMP,
+                                                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS chunks (
+                                                  id TEXT PRIMARY KEY,
+                                                  download_id TEXT REFERENCES downloads(id) ON DELETE CASCADE,
+                index INTEGER NOT NULL,
+                start_byte BIGINT NOT NULL,
+                end_byte BIGINT,
+                downloaded_bytes BIGINT DEFAULT 0,
+                status TEXT DEFAULT 'PENDING',
+                UNIQUE(download_id, index)
+                );
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS settings (
+                                                    key TEXT PRIMARY KEY,
+                                                    value JSONB NOT NULL
+            );
+        `);
+
+        client.release();
+    } catch (err: any) {
+        console.warn(
+            `PostgreSQL service not reachable (${err.message}).\n` +
+            `Falling back to File-Backed Local Storage: "${FALLBACK_FILE}".\n` +
+            `This guarantees a fully operational state in development environments. When executed with PostgreSQL, it will bind seamlessly.`
+        );
+        isPostgresAvailable = false;
+    }
+}
+
+// Unified query wrapper supporting both drivers
+export async function query(sql: string, params: any[] = []): Promise<any[]> {
+    if (isPostgresAvailable && pool) {
+        try {
+            const res = await pool.query(sql, params);
+            return res.rows.map(toCamel);
+        } catch (e: any) {
+            console.error("SQL Execution failed on Postgres. Redirecting to Local Storage fallback.", e.message);
+        }
+    }
+
+    // Fallback engine emulator for simple SQL statements used by downloads controller
+    const lowerSql = sql.toLowerCase();
+
+    // 1. SELECT ALL DOWNLOADS
+    if (lowerSql.includes("select d.*") && lowerSql.includes("left join chunks")) {
+        const downloads = fallbackDb.getDownloads();
+        return downloads.map((d) => {
+            const chunks = fallbackDb.getChunks(d.id);
+            return {
+                ...d,
+                chunks,
+            };
+        });
+    }
+
+    // 2. SELECT BY ID
+    if (lowerSql.includes("where d.id =") || (lowerSql.includes("where id =") && lowerSql.includes("downloads"))) {
+        const id = params[0];
+        const download = fallbackDb.getDownload(id);
+        if (!download) return [];
+        const chunks = fallbackDb.getChunks(id);
+        return [{ ...download, chunks }];
+    }
+
+    // 3. SELECT ALL CHUNKS BY DOWNLOAD ID
+    if (lowerSql.includes("select * from chunks") && lowerSql.includes("download_id =")) {
+        const downloadId = params[0];
+        return fallbackDb.getChunks(downloadId);
+    }
+
+    // 4. INSERT DOWNLOAD
+    if (lowerSql.includes("insert into downloads")) {
+        // VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        // [id, url, uniqueName, relativeDir, totalSize, 0, effectiveChunkCount, 'PENDING', scheduleDate]
+        const [id, url, filename, directory, totalSize, downloadedSize, chunkCount, status, scheduledAt] = params;
+        const item = fallbackDb.insertDownload({
+            id,
+            url,
+            filename,
+            directory,
+            totalSize: totalSize ? Number(totalSize) : null,
+            downloadedSize: Number(downloadedSize) || 0,
+            chunkCount: Number(chunkCount),
+            status: status || "PENDING",
+            scheduledAt: scheduledAt || null,
+        });
+        return [item];
+    }
+
+    // 5. UPDATE DOWNLOAD STATUS
+    if (lowerSql.includes("update downloads set status =") && lowerSql.includes("where id =")) {
+        const [status, id] = params;
+        const item = fallbackDb.updateDownload(id, { status });
+        return item ? [item] : [];
+    }
+
+    // 6. UPDATE DOWNLOAD SIZE
+    if (lowerSql.includes("update downloads set downloaded_size =") && lowerSql.includes("where id =")) {
+        const [size, id] = params;
+        const item = fallbackDb.updateDownload(id, { downloadedSize: Number(size) });
+        return item ? [item] : [];
+    }
+
+    // 7. INSERT CHUNK
+    if (lowerSql.includes("insert into chunks")) {
+        // [id, download_id, index, start_byte, end_byte, downloaded_bytes, status]
+        const [id, downloadId, index, startByte, endByte, downloadedBytes, status] = params;
+        const item = fallbackDb.insertChunk({
+            id,
+            downloadId,
+            index: Number(index),
+            startByte: Number(startByte),
+            endByte: endByte ? Number(endByte) : null,
+            downloadedBytes: Number(downloadedBytes) || 0,
+            status: status || "PENDING",
+        });
+        return [item];
+    }
+
+    // 8. UPDATE CHUNK STATUS / PROGRESS
+    if (lowerSql.includes("update chunks set downloaded_bytes =") && lowerSql.includes("status =")) {
+        // UPDATE chunks SET downloaded_bytes = $1, status = $2 WHERE id = $3
+        const [downloadedBytes, status, id] = params;
+        const item = fallbackDb.updateChunk(id, { downloadedBytes: Number(downloadedBytes), status });
+        return item ? [item] : [];
+    }
+
+    if (lowerSql.includes("update chunks set status =") && lowerSql.includes("downloaded_bytes =")) {
+        // UPDATE chunks SET status = $1, downloaded_bytes = $2 WHERE id = $3
+        const [status, downloadedBytes, id] = params;
+        const item = fallbackDb.updateChunk(id, { downloadedBytes: Number(downloadedBytes), status });
+        return item ? [item] : [];
+    }
+
+    // 9. RE-INIT OR DELETE CHUNKS
+    if (lowerSql.includes("update chunks set downloaded_bytes = 0") && lowerSql.includes("download_id =")) {
+        const [status, downloadId] = params;
+        const chunks = fallbackDb.getChunks(downloadId);
+        chunks.forEach((c) => {
+            fallbackDb.updateChunk(c.id, { downloadedBytes: 0, status: "PENDING" });
+        });
+        fallbackDb.updateDownload(downloadId, { downloadedSize: 0, status: "PENDING" });
+        return [];
+    }
+
+    // 10. DELETE DOWNLOAD
+    if (lowerSql.includes("delete from downloads")) {
+        const id = params[0];
+        fallbackDb.deleteDownload(id);
+        return [];
+    }
+
+    // 11. SETTINGS OPERATIONS
+    if (lowerSql.includes("select value from settings") && lowerSql.includes("where key =")) {
+        const key = params[0];
+        const val = fallbackDb.getSetting(key);
+        return val !== null ? [{ value: val }] : [];
+    }
+
+    if (lowerSql.includes("insert into settings")) {
+        const [key, value] = params;
+        fallbackDb.setSetting(key, value);
+        return [];
+    }
+
+    // 12. GENERAL DOWNLOAD STATUS QUERY
+    if (lowerSql.includes("select id, status, scheduled_at from downloads")) {
+        const nowISO = params[0] || new Date().toISOString();
+        const downloads = fallbackDb.getDownloads();
+
+        if (lowerSql.includes("scheduled_at <= $1")) {
+            return downloads.filter(
+                (d) =>
+                    ["PENDING", "SCHEDULED"].includes(d.status) &&
+                    d.scheduledAt &&
+                    new Date(d.scheduledAt) <= new Date(nowISO)
+            );
+        }
+        if (lowerSql.includes("scheduled_at > $1")) {
+            return downloads.filter(
+                (d) => d.status === "SCHEDULED" && d.scheduledAt && new Date(d.scheduledAt) > new Date(nowISO)
+            );
+        }
+    }
+
+    return [];
+}
+
+export async function queryOne(sql: string, params: any[] = []): Promise<any | null> {
+    const rows = await query(sql, params);
+    return rows.length ? rows[0] : null;
+}
+
+export function generateId(): string {
+    return uuidv4();
+}
+```
+
+src/server/downloader.ts:
+```
+import axios from "axios";
+import fs from "fs";
+import path from "path";
+import EventEmitter from "events";
+import { query, queryOne, generateId, DownloadRecord, ChunkRecord } from "./db";
+import { ensureUniqueFilename } from "./pathSanitizer";
+
+export class DownloadService {
+  public static activeDownloads = new Map<
+    string,
+    {
+      abortController: AbortController;
+      filePath: string;
+      finalPath: string;
+      chunks: Array<{
+        id: string;
+        start: number;
+        end: number | undefined;
+        downloaded: number;
+      }>;
+    }
+  >();
+
+  public static eventEmitter = new EventEmitter();
+  public static progressCache = new Map<
+    string,
+    {
+      chunks: Array<{ id: string; downloaded: number }>;
+      totalSize: number | null;
+    }
+  >();
+
+  private static isCancelError(err: any): boolean {
+    return axios.isCancel(err) || (err && err.code === "ERR_CANCELED");
+  }
+
+  public static async startDownload(downloadId: string, downloadDir: string): Promise<void> {
+    let download = await queryOne("SELECT * FROM downloads WHERE id = $1", [downloadId]) as DownloadRecord | null;
+    if (!download) throw new Error("Download task not found");
+    if (download.status === "COMPLETED") return;
+    if (download.status === "PAUSED") return;
+
+    const totalSize = download.totalSize ? Number(download.totalSize) : null;
+    const chunkCount = download.chunkCount || 1;
+
+    const baseDir = path.resolve(downloadDir, download.directory);
+    await fs.promises.mkdir(baseDir, { recursive: true });
+    const finalPath = path.join(baseDir, download.filename);
+    const tempPath = finalPath + ".part";
+
+    let chunks = await query("SELECT * FROM chunks WHERE download_id = $1 ORDER BY index ASC", [downloadId]) as ChunkRecord[];
+
+    const isFresh = chunks.length === 0 && Number(download.downloadedSize) === 0;
+    if (download.status === "PENDING" && isFresh) {
+      const { finalName } = await ensureUniqueFilename(baseDir, download.filename);
+      if (finalName !== download.filename) {
+        await query("UPDATE downloads SET filename = $1 WHERE id = $2", [finalName, downloadId]);
+        download = await queryOne("SELECT * FROM downloads WHERE id = $1", [downloadId]) as DownloadRecord | null;
+        if (!download) throw new Error("Download task lost during verification");
+      }
+    }
+
+    if (chunks.length === 0) {
+      chunks = await this.createChunks(downloadId, chunkCount, totalSize);
+    }
+
+    // Set up partial write file
+    if (totalSize) {
+      try {
+        const fd = fs.openSync(tempPath, "w");
+        fs.ftruncateSync(fd, totalSize);
+        fs.closeSync(fd);
+      } catch (err: any) {
+        console.warn("Could not preallocate download disk space:", err.message);
+      }
+    } else {
+      try {
+        await fs.promises.writeFile(tempPath, "");
+      } catch (err: any) {
+        console.warn("Temp part creation failed:", err.message);
+      }
+    }
+
+    const abortController = new AbortController();
+    await query("UPDATE downloads SET status = $1 WHERE id = $2", ["DOWNLOADING", downloadId]);
+
+    this.eventEmitter.emit("downloadStarted", downloadId);
+
+    this.progressCache.set(downloadId, {
+      chunks: chunks.map((c) => ({ id: c.id, downloaded: Number(c.downloadedBytes) })),
+      totalSize,
+    });
+
+    this.activeDownloads.set(downloadId, {
+      abortController,
+      filePath: tempPath,
+      finalPath,
+      chunks: chunks.map((c) => ({
+        id: c.id,
+        start: Number(c.startByte),
+        end: c.endByte ? Number(c.endByte) : undefined,
+        downloaded: Number(c.downloadedBytes),
+      })),
+    });
+
+    const tasks = chunks.map((_, i) => () => this.downloadChunk(downloadId, i, abortController.signal));
+    const concurrency = Math.min(chunkCount, 4);
+    let error: any = null;
+
+    try {
+      await this.runWithConcurrency(tasks, concurrency);
+    } catch (err: any) {
+      error = err;
+      if (this.isCancelError(err)) {
+        await this.flushProgress(downloadId);
+        await query("UPDATE downloads SET status = $1 WHERE id = $2", ["PAUSED", downloadId]);
+        this.activeDownloads.delete(downloadId);
+        this.progressCache.delete(downloadId);
+        this.eventEmitter.emit("downloadPaused", downloadId);
+        return;
+      }
+    }
+
+    try {
+      await this.flushProgress(downloadId);
+    } catch (flushErr) {
+      console.error(`Flush progress failed for ${downloadId}:`, flushErr);
+    }
+
+    let allDone = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const rows = await query("SELECT status FROM chunks WHERE download_id = $1", [downloadId]);
+      allDone = rows.every((r) => r.status === "DONE");
+      if (allDone) break;
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 500));
+    }
+
+    if (!error && allDone) {
+      await this.markComplete(downloadId);
+      this.eventEmitter.emit("downloadComplete", downloadId);
+    } else {
+      const stat = await fs.promises.stat(tempPath).catch(() => null);
+      if (stat && totalSize && stat.size === totalSize) {
+        console.log(`Download ${downloadId} completed, mismatch override handled.`);
+        await this.markComplete(downloadId);
+        this.eventEmitter.emit("downloadComplete", downloadId);
+      } else {
+        await this.markError(downloadId);
+        this.eventEmitter.emit("downloadError", downloadId);
+      }
+    }
+
+    this.activeDownloads.delete(downloadId);
+    this.progressCache.delete(downloadId);
+  }
+
+  private static async createChunks(downloadId: string, chunkCount: number, totalSize: number | null): Promise<ChunkRecord[]> {
+    const list: Array<Omit<ChunkRecord, "id">> = [];
+    if (!totalSize) {
+      list.push({ downloadId, index: 0, startByte: 0, endByte: null, downloadedBytes: 0, status: "PENDING" });
+    } else {
+      const chunkSize = Math.ceil(totalSize / chunkCount);
+      for (let i = 0; i < chunkCount; i++) {
+        const start = i * chunkSize;
+        const end = i === chunkCount - 1 ? totalSize - 1 : start + chunkSize - 1;
+        list.push({ downloadId, index: i, startByte: start, endByte: end, downloadedBytes: 0, status: "PENDING" });
+      }
+    }
+
+    for (const ch of list) {
+      const id = generateId();
+      await query(
+        `INSERT INTO chunks (id, download_id, index, start_byte, end_byte, downloaded_bytes, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [id, ch.downloadId, ch.index, ch.startByte, ch.endByte, ch.downloadedBytes, ch.status]
+      );
+    }
+    return (await query("SELECT * FROM chunks WHERE download_id = $1 ORDER BY index ASC", [downloadId])) as ChunkRecord[];
+  }
+
+  private static async downloadChunk(downloadId: string, chunkIndex: number, signal: AbortSignal): Promise<void> {
+    const chunk = (await queryOne("SELECT * FROM chunks WHERE download_id = $1 AND index = $2", [downloadId, chunkIndex])) as ChunkRecord | null;
+    if (!chunk) throw new Error(`Chunk with index ${chunkIndex} not found`);
+    if (chunk.status === "DONE") return;
+
+    const startByte = Number(chunk.startByte);
+    const endByte = chunk.endByte ? Number(chunk.endByte) : undefined;
+    const alreadyDownloaded = Number(chunk.downloadedBytes);
+    const startFrom = startByte + alreadyDownloaded;
+
+    if (endByte !== undefined && alreadyDownloaded >= endByte - startByte + 1) {
+      await this.markChunkDone(chunk.id, alreadyDownloaded);
+      const cache = this.progressCache.get(downloadId);
+      if (cache) {
+        const total = cache.chunks.reduce((sum, c) => sum + c.downloaded, 0);
+        this.eventEmitter.emit("progress", downloadId, {
+          chunkId: chunk.id,
+          chunkDownloadedBytes: alreadyDownloaded,
+          downloadedBytes: total,
+          total,
+        });
+      }
+      return;
+    }
+
+    const download = (await queryOne("SELECT * FROM downloads WHERE id = $1", [downloadId])) as DownloadRecord | null;
+    if (!download) throw new Error("Download metadata not found inside chunk handler");
+
+    const url = download.url;
+    const headers: Record<string, string> = {};
+    if (endByte !== undefined) {
+      headers["Range"] = `bytes=${startFrom}-${endByte}`;
+    } else {
+      headers["Range"] = `bytes=${startFrom}-`;
+    }
+
+    const active = this.activeDownloads.get(downloadId);
+    if (!active) throw new Error("Download activity is not currently active");
+    const filePath = active.filePath;
+
+    const chunkMem = active.chunks.find((c) => c.id === chunk.id);
+    if (!chunkMem) throw new Error("Chunk tracking was not found in active state list");
+
+    let downloadedBytes = alreadyDownloaded;
+    let lastDbUpdate = alreadyDownloaded;
+    const dbUpdateThreshold = 512 * 1024; // Limit excessive database access cycles (512 KB)
+
+    const response = await axios({
+      method: "GET",
+      url,
+      headers,
+      responseType: "stream",
+      timeout: 30000,
+      signal,
+      onDownloadProgress: (progressEvent) => {
+        const current = alreadyDownloaded + progressEvent.loaded;
+        downloadedBytes = current;
+        chunkMem.downloaded = current;
+
+        const cache = this.progressCache.get(downloadId);
+        if (cache) {
+          const chunkCache = cache.chunks.find((c) => c.id === chunk.id);
+          if (chunkCache) chunkCache.downloaded = current;
+          const total = cache.chunks.reduce((sum, c) => sum + c.downloaded, 0);
+          this.eventEmitter.emit("progress", downloadId, {
+            chunkId: chunk.id,
+            chunkDownloadedBytes: current,
+            downloadedBytes: total,
+            total,
+          });
+        }
+
+        if (current - lastDbUpdate >= dbUpdateThreshold) {
+          lastDbUpdate = current;
+          this.updateProgress(downloadId, chunk.id, current).catch(() => {});
+        }
+      },
+    });
+
+    const writeStream = fs.createWriteStream(filePath, { flags: "r+", start: startFrom });
+    await new Promise<void>((resolve, reject) => {
+      response.data.pipe(writeStream);
+      writeStream.on("finish", () => {
+        writeStream.close();
+        resolve();
+      });
+      writeStream.on("error", (err: any) => reject(err));
+      response.data.on("error", (err: any) => reject(err));
+    });
+
+    await this.updateProgress(downloadId, chunk.id, downloadedBytes).catch(() => {});
+    await this.markChunkDone(chunk.id, downloadedBytes);
+
+    const cache = this.progressCache.get(downloadId);
+    if (cache) {
+      const chunkCache = cache.chunks.find((c) => c.id === chunk.id);
+      if (chunkCache) chunkCache.downloaded = downloadedBytes;
+      const total = cache.chunks.reduce((sum, c) => sum + c.downloaded, 0);
+      this.eventEmitter.emit("progress", downloadId, {
+        chunkId: chunk.id,
+        chunkDownloadedBytes: downloadedBytes,
+        downloadedBytes: total,
+        total,
+      });
+    }
+  }
+
+  private static async markChunkDone(chunkId: string, downloadedBytes: number): Promise<void> {
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await query("UPDATE chunks SET status = $1, downloaded_bytes = $2 WHERE id = $3", ["DONE", downloadedBytes, chunkId]);
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+    throw lastErr;
+  }
+
+  private static async updateProgress(downloadId: string, chunkId: string, downloadedBytes: number): Promise<void> {
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await query("UPDATE chunks SET downloaded_bytes = $1, status = $2 WHERE id = $3", [downloadedBytes, "ACTIVE", chunkId]);
+        const rows = await query("SELECT downloaded_bytes FROM chunks WHERE download_id = $1", [downloadId]);
+        const total = rows.reduce((acc, r) => acc + Number(r.downloadedBytes), 0);
+        await query("UPDATE downloads SET downloaded_size = $1 WHERE id = $2", [total, downloadId]);
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+    throw lastErr;
+  }
+
+  private static async flushProgress(downloadId: string): Promise<void> {
+    const active = this.activeDownloads.get(downloadId);
+    if (!active) return;
+    for (const chunkMem of active.chunks) {
+      await query("UPDATE chunks SET downloaded_bytes = $1, status = $2 WHERE id = $3", [chunkMem.downloaded, "ACTIVE", chunkMem.id]);
+    }
+    const rows = await query("SELECT downloaded_bytes FROM chunks WHERE download_id = $1", [downloadId]);
+    const total = rows.reduce((acc, r) => acc + Number(r.downloadedBytes), 0);
+    await query("UPDATE downloads SET downloaded_size = $1 WHERE id = $2", [total, downloadId]);
+  }
+
+  private static async runWithConcurrency(tasks: Array<() => Promise<any>>, concurrency: number): Promise<void> {
+    const executing: Array<Promise<any>> = [];
+    const results: Array<Promise<any>> = [];
+
+    for (const task of tasks) {
+      const p: Promise<any> = task()
+        .then((result) => {
+          const idx = executing.indexOf(p);
+          if (idx !== -1) executing.splice(idx, 1);
+          return result;
+        })
+        .catch((err) => {
+          const idx = executing.indexOf(p);
+          if (idx !== -1) executing.splice(idx, 1);
+          throw err;
+        });
+      results.push(p);
+      executing.push(p);
+
+      if (executing.length >= concurrency) {
+        await Promise.race(executing);
+      }
+    }
+    await Promise.all(results);
+  }
+
+  private static async markComplete(downloadId: string): Promise<void> {
+    const download = (await queryOne("SELECT * FROM downloads WHERE id = $1", [downloadId])) as DownloadRecord | null;
+    if (!download) return;
+
+    // Use default if there's no custom directory
+    const finalDir = path.resolve("./downloads", download.directory);
+    const finalPath = path.join(finalDir, download.filename);
+    const tempPath = finalPath + ".part";
+
+    try {
+      await fs.promises.access(tempPath);
+      await fs.promises.rename(tempPath, finalPath);
+    } catch (err: any) {
+      if (err.code !== "ENOENT") {
+        console.error(`Rename complete file failed: ${err.message}`);
+      }
+    }
+
+    await query("UPDATE downloads SET status = $1 WHERE id = $2", ["COMPLETED", downloadId]);
+    this.activeDownloads.delete(downloadId);
+    this.progressCache.delete(downloadId);
+  }
+
+  private static async markError(downloadId: string): Promise<void> {
+    await query("UPDATE downloads SET status = $1 WHERE id = $2", ["ERROR", downloadId]);
+    this.activeDownloads.delete(downloadId);
+    this.progressCache.delete(downloadId);
+  }
+
+  public static async pauseDownload(downloadId: string): Promise<void> {
+    const active = this.activeDownloads.get(downloadId);
+    if (active) {
+      active.abortController.abort();
+    }
+    await query("UPDATE downloads SET status = $1 WHERE id = $2", ["PAUSED", downloadId]);
+    this.progressCache.delete(downloadId);
+  }
+
+  public static async resumeDownload(downloadId: string, downloadDir: string): Promise<void> {
+    const download = (await queryOne("SELECT * FROM downloads WHERE id = $1", [downloadId])) as DownloadRecord | null;
+    if (!download) throw new Error("Download metadata not found for resume target");
+    if (download.status !== "PAUSED" && download.status !== "ERROR") {
+      throw new Error("Only suspended/failed downloads can be resumed directly");
+    }
+    await query("UPDATE downloads SET status = $1 WHERE id = $2", ["PENDING", downloadId]);
+    this.eventEmitter.emit("downloadResumed", downloadId);
+    // Offload starts asynchronously
+    this.startDownload(downloadId, downloadDir).catch(err => {
+      console.error(`Async resuming download failed for task [${downloadId}]`, err);
+    });
+  }
+
+  public static async stopDownload(downloadId: string): Promise<void> {
+    const active = this.activeDownloads.get(downloadId);
+    if (active) {
+      active.abortController.abort();
+      this.activeDownloads.delete(downloadId);
+      this.progressCache.delete(downloadId);
+    }
+    await query("UPDATE downloads SET status = $1 WHERE id = $2", ["ERROR", downloadId]);
+  }
+}
+```
+
+src/server/pathSanitizer.ts:
+```
+import path from "path";
+import fs from "fs";
+
+// Fallback or dynamic directory provider
+let dlDir = "./downloads";
+
+export function configureDownloadDirectory(newPath: string) {
+  dlDir = path.resolve(newPath);
+}
+
+export function sanitizeDirectory(userDir: string): string {
+  const base = path.resolve(dlDir);
+  const target = path.resolve(base, userDir);
+  if (!target.startsWith(base)) {
+    throw new Error("Directory traversal not allowed");
+  }
+  return target;
+}
+
+export async function ensureUniqueFilename(dirPath: string, baseName: string): Promise<{ finalPath: string; finalName: string }> {
+  const ext = path.extname(baseName);
+  const name = path.basename(baseName, ext);
+  let counter = 0;
+  let finalName = baseName;
+  let finalPath = path.join(dirPath, finalName);
+
+  while (true) {
+    try {
+      await fs.promises.access(finalPath);
+      counter++;
+      finalName = `${name} (${counter})${ext}`;
+      finalPath = path.join(dirPath, finalName);
+    } catch {
+      break;
+    }
+  }
+  return { finalPath, finalName };
+}
+```
+
+src/server/scheduler.ts:
+```
+import schedule from "node-schedule";
+import { query } from "./db";
+import { enqueueDownload } from "./taskQueue";
+
+const scheduledJobs = new Map<string, schedule.Job>();
+
+export async function initScheduler(): Promise<void> {
+  const now = new Date().toISOString();
+
+  // 1. Process downloads that were scheduled in the past but missed
+  const due = await query(
+    `SELECT id, status, scheduled_at FROM downloads
+     WHERE status IN ('PENDING', 'SCHEDULED')
+       AND scheduled_at <= $1`,
+    [now]
+  );
+
+  for (const d of due) {
+    enqueueDownload(d.id);
+    if (d.status === "SCHEDULED") {
+      await query("UPDATE downloads SET status = $1 WHERE id = $2", ["PENDING", d.id]);
+    }
+  }
+
+  // 2. Schedule future downloads
+  const future = await query(
+    `SELECT id, scheduled_at FROM downloads
+     WHERE status = 'SCHEDULED' AND scheduled_at > $1`,
+    [now]
+  );
+
+  for (const d of future) {
+    if (d.scheduledAt) {
+      scheduleDownload(d.id, new Date(d.scheduledAt));
+    }
+  }
+}
+
+export function scheduleDownload(downloadId: string, date: Date): void {
+  // Clear any existing job configuration
+  cancelScheduledJob(downloadId);
+
+  const job = schedule.scheduleJob(date, async () => {
+    try {
+      await query("UPDATE downloads SET status = $1, scheduled_at = NULL WHERE id = $2", ["PENDING", downloadId]);
+      enqueueDownload(downloadId);
+    } catch (err) {
+      console.error(`Failed to execute scheduled trigger for task ${downloadId}:`, err);
+    } finally {
+      scheduledJobs.delete(downloadId);
+    }
+  });
+
+  scheduledJobs.set(downloadId, job);
+}
+
+export function cancelScheduledJob(downloadId: string): void {
+  const job = scheduledJobs.get(downloadId);
+  if (job) {
+    job.cancel();
+    scheduledJobs.delete(downloadId);
+  }
+}
+```
+
+src/server/settings.ts:
+```
+import { query, queryOne } from "./db";
+
+export async function getSetting<T = any>(key: string): Promise<T | null> {
+  const row = await queryOne("SELECT value FROM settings WHERE key = $1", [key]);
+  return row ? (row.value as T) : null;
+}
+
+export async function setSetting(key: string, value: any): Promise<void> {
+  await query(
+    `INSERT INTO settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [key, JSON.stringify(value)]
+  );
+}
+
+export async function initSettings(): Promise<void> {
+  const defaults: Record<string, any> = {
+    downloadDirectory: "./downloads",
+    maxConcurrentTasks: 3,
+    defaultChunkCount: 4,
+  };
+
+  for (const [key, val] of Object.entries(defaults)) {
+    const existing = await getSetting(key);
+    if (existing === null) {
+      await setSetting(key, val);
+    }
+  }
+}
+```
+
+src/server/taskQueue.ts:
+```
+import { DownloadService } from "./downloader";
+import { getSetting } from "./settings";
+
+class TaskQueue {
+  private queue: string[] = [];
+  private activeCount = 0;
+  private maxConcurrency = 3;
+
+  constructor() {
+    this.syncMaxConcurrency();
+  }
+
+  public async syncMaxConcurrency() {
+    const limit = await getSetting<number>("maxConcurrentTasks");
+    if (limit && limit > 0) {
+      this.maxConcurrency = limit;
+    }
+  }
+
+  public setConcurrency(limit: number) {
+    if (limit > 0) {
+      this.maxConcurrency = limit;
+      this.processNext();
+    }
+  }
+
+  public enqueue(downloadId: string) {
+    if (!this.queue.includes(downloadId)) {
+      this.queue.push(downloadId);
+      this.processNext();
+    }
+  }
+
+  private async processNext() {
+    if (this.activeCount >= this.maxConcurrency || this.queue.length === 0) {
+      return;
+    }
+
+    const downloadId = this.queue.shift()!;
+    this.activeCount++;
+
+    try {
+      const downloadDirectory = (await getSetting<string>("downloadDirectory")) || "./downloads";
+      await DownloadService.startDownload(downloadId, downloadDirectory);
+    } catch (err) {
+      console.error(`Error processing task [${downloadId}] in queue:`, err);
+    } finally {
+      this.activeCount--;
+      this.processNext();
+    }
+  }
+}
+
+export const taskQueue = new TaskQueue();
+
+export function enqueueDownload(downloadId: string) {
+  taskQueue.enqueue(downloadId);
+}
+```
+
+tsconfig.json:
+```
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false,
+    "module": "ESNext",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "allowJs": true,
+    "jsx": "react-jsx",
+    "paths": {
+      "@/*": [
+        "./*"
+      ]
+    },
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  }
+}
+```
+
+vite.config.ts:
+```
+import tailwindcss from '@tailwindcss/vite';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+import {defineConfig} from 'vite';
+
+export default defineConfig(() => {
+  return {
+    plugins: [react(), tailwindcss()],
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, '.'),
+      },
+    },
+    server: {
+      // HMR is disabled in AI Studio via DISABLE_HMR env var.
+      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
+      hmr: process.env.DISABLE_HMR !== 'true',
+      // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
+      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+    },
+  };
+});
+```

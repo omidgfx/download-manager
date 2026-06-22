@@ -1,0 +1,5 @@
+{
+  "name": "Fletch Downloader",
+  "description": "A smart multipart download manager with scheduling and real-time visualizer.",
+  "requestFramePermissions": []
+}
