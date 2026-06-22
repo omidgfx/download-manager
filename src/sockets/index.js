@@ -23,7 +23,7 @@ function initSocket(server) {
             chunkId: progress.chunkId,
             chunkDownloadedBytes,
             downloadedBytes: progress.downloadedBytes,
-            total: totalSize,
+            total: progress.total,
             totalSize,
         });
     });
