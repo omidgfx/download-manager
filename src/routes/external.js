@@ -9,12 +9,16 @@ const { enqueueDownload } = require('../services/taskQueue');
 const axios = require('axios');
 const { query, generateId } = require('../db');
 
-router.get('/', async (req, res) => {
+// This route is mounted at '/'. It only processes requests that have a 'url' query parameter.
+router.get('/', async (req, res, next) => {
     const { url, dir, name } = req.query;
+
+    // If no 'url' parameter, pass control to the next handler (static files, catch‑all)
     if (!url) {
-        return res.status(400).json({ error: 'Missing url parameter' });
+        return next();
     }
 
+    // --- Process the external download request ---
     const decodedUrl = decodeURIComponent(url);
     try {
         new URL(decodedUrl);
@@ -39,6 +43,7 @@ router.get('/', async (req, res) => {
     await fs.mkdir(basePath, { recursive: true });
     const { finalName: uniqueName } = await ensureUniqueFilename(basePath, finalName);
 
+    // Detect range support
     let supportsRange = false;
     try {
         const headRes = await axios.head(decodedUrl, { timeout: 5000 });
@@ -53,13 +58,15 @@ router.get('/', async (req, res) => {
     const id = generateId();
     const result = await query(
         `INSERT INTO downloads (id, url, filename, directory, total_size, downloaded_size, chunk_count, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     RETURNING *`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING *`,
         [id, decodedUrl, uniqueName, relativeDir, null, 0, effectiveChunkCount, 'PENDING']
     );
     const download = result[0];
 
     enqueueDownload(download.id);
+
+    // Return a JSON response (or you could redirect to the UI)
     res.json({ success: true, taskId: download.id, filename: uniqueName });
 });
 

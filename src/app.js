@@ -48,15 +48,23 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ----- IMPORTANT: externalRoutes must be mounted BEFORE static files -----
+// It handles requests to '/' with a 'url' query parameter.
+// If no 'url' param, it calls next() and the static/catch-all handle the rest.
+app.use('/', externalRoutes);
+
+// Serve static files (UI)
 app.use(express.static(path.join(__dirname, '../public')));
 
+// API routes (mounted under /api)
 app.use('/api', apiRoutes);
-app.use('/dl.hamvarz.ir', externalRoutes);
 
+// Catch-all: serve the index.html for any other GET requests (SPA)
 app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, '../public/index.html'));
 });
 
+// Error handler
 app.use((err, req, res, next) => {
     console.error(err.stack);
     res.status(500).json({ error: 'Something went wrong!' });
