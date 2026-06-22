@@ -21,12 +21,25 @@ function getStatusBadge(status) {
     return `badge ${map[status] || 'badge-ghost'}`;
 }
 
+// Helper: compute chunk size from download and chunk index
+function getChunkSize(download, chunkIndex) {
+    const total = Number(download.totalSize) || 0;
+    const count = download.chunkCount || 1;
+    if (total === 0) return 0; // unknown
+    const base = Math.floor(total / count);
+    // last chunk gets the remainder
+    if (chunkIndex === count - 1) {
+        return total - (base * (count - 1));
+    }
+    return base;
+}
+
 async function fetchDownloads() {
     const res = await fetch('/api/downloads');
     const downloads = await res.json();
     const container = document.getElementById('downloadList');
     container.innerHTML = downloads.map(d => {
-        const total = d.totalSize ? Number(d.totalSize) : 0;
+        const total = Number(d.totalSize) || 0;
         const downloaded = Number(d.downloadedSize);
         const percent = total > 0 ? Math.min(100, (downloaded / total) * 100) : 0;
         const scheduled = d.scheduledAt ? new Date(d.scheduledAt).toLocaleString() : '';
@@ -35,14 +48,20 @@ async function fetchDownloads() {
         if (d.chunks && d.chunks.length > 0) {
             chunkBars = `<div class="mt-2 space-y-1 text-xs">
                 ${d.chunks.map(chunk => {
-                const start = Number(chunk.startByte);
-                const end = chunk.endByte ? Number(chunk.endByte) : null;
-                const chunkSize = end ? end - start + 1 : 0;
+                const index = chunk.index;
+                // Compute chunk size reliably
+                let chunkSize = 0;
+                if (chunk.endByte !== null && chunk.endByte !== undefined) {
+                    chunkSize = Number(chunk.endByte) - Number(chunk.startByte) + 1;
+                } else {
+                    // fallback using total size and chunk count
+                    chunkSize = getChunkSize(d, index);
+                }
                 const downloadedChunk = Number(chunk.downloadedBytes);
                 const chunkPercent = chunkSize > 0 ? Math.min(100, (downloadedChunk / chunkSize) * 100) : 0;
                 const statusColor = chunk.status === 'DONE' ? 'bg-success' : chunk.status === 'ACTIVE' ? 'bg-primary' : 'bg-gray-300';
                 return `<div class="flex items-center gap-2">
-                        <span class="w-12 text-right">#${chunk.index}</span>
+                        <span class="w-12 text-right">#${index}</span>
                         <div class="flex-1 bg-gray-200 rounded-full h-2 relative">
                             <div class="chunk-bar ${statusColor} h-2 rounded-full transition-all duration-300" 
                                  data-chunk-id="${chunk.id}" 
@@ -110,12 +129,14 @@ socket.on('downloadProgress', (data) => {
     // Chunk bar
     const chunkBar = card.querySelector(`.chunk-bar[data-chunk-id="${chunkId}"]`);
     if (chunkBar) {
-        const chunkSize = parseInt(chunkBar.dataset.chunkSize, 10);
+        let chunkSize = parseInt(chunkBar.dataset.chunkSize, 10);
+        // If chunk size is still 0, we cannot show percentage; keep bar gray or use downloaded relative to something?
+        // We'll set width to 0 if unknown.
         const chunkPercent = chunkSize > 0 ? Math.min(100, (chunkDownloadedBytes / chunkSize) * 100) : 0;
         chunkBar.style.width = chunkPercent + '%';
         const textSpan = card.querySelector(`.chunk-text-${chunkId}`);
         if (textSpan) {
-            textSpan.textContent = `${formatBytes(chunkDownloadedBytes)} / ${formatBytes(chunkSize)}`;
+            textSpan.textContent = `${formatBytes(chunkDownloadedBytes)} / ${chunkSize > 0 ? formatBytes(chunkSize) : '?'}`;
         }
         // Update status badge
         const badge = chunkBar.closest('.flex').querySelector('.badge');

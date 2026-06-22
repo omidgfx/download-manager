@@ -6,12 +6,10 @@ async function getSetting(key) {
 }
 
 async function setSetting(key, value) {
-    // Convert value to valid JSON
-    const jsonValue = JSON.stringify(value);
     await query(
-        `INSERT INTO settings (key, value) VALUES ($1, $2::jsonb)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-        [key, jsonValue]
+        `INSERT INTO settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [key, value]
     );
 }
 
